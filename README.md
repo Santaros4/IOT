@@ -4,7 +4,7 @@
 
 *Creators Note* - I have long desired a program specifically tailored to quickly & efficiently organize photos and perform useful related functions. Having never found anything fit for purpose, I decided to create my own. 
 
-A fast workflow focused all-in-one desktop tool for sorting photo collections: browse a folder of images as a thumbnail grid, then split, rename, copy, resize, de-duplicate and tag folders with bare minimum actions. The last 20 changes are remembered and can be undone until close.
+A fast workflow focused all-in-one desktop tool for sorting photo collections: browse a folder of images as a thumbnail grid, then split, rename, copy, resize, de-duplicate and tag folders with bare minimum actions required. The last 20 changes are remembered and can be undone until close.
 
 ![The main window](docs/main-window.png)
 
