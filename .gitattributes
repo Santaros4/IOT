@@ -1,0 +1,6 @@
+# Same line endings (LF) on every computer: I.O.T is used on Windows, macOS and Linux
+* text=auto eol=lf
+
+# Never touch images
+*.png binary
+*.jpg binary

@@ -1,0 +1,21 @@
+# Personal settings and logs, created next to iot.py
+iot_settings.json
+iot_settings.json.tmp
+iot_change_log.txt
+iot_change_log.txt.old
+iot_crash.log
+iot_crash.log.old
+.iot_write_test
+
+# Python's compiled cache
+__pycache__/
+*.py[cod]
+
+# Created inside a photo hub (if a hub is ever inside this folder)
+.thumbs_cache/
+.iot_recycle/
+.iot_tags.json
+.iot_tags.json.tmp
+*.iot_tmp
+.iot_stage_*
+.iot_undo_*
