@@ -8,8 +8,8 @@ the folder list, tag colours, key-caps, the zoom slider).
 import sys
 
 from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import (QColor, QConicalGradient, QFont, QFontDatabase, QFontMetrics, QImage, QLinearGradient,
-                           QPainter, QPainterPath, QPen, QPixmap)
+from PySide6.QtGui import (QColor, QConicalGradient, QFont, QFontDatabase, QFontMetrics, QGuiApplication, QImage,
+                           QLinearGradient, QPainter, QPainterPath, QPen, QPixmap)
 from PySide6.QtWidgets import (QApplication, QDialog, QFrame, QGraphicsDropShadowEffect, QGridLayout, QHBoxLayout,
                                QLabel, QLayout, QPushButton, QSizePolicy, QVBoxLayout, QWidget)
 
@@ -516,6 +516,7 @@ class GradientDialog(QDialog):
     def __init__(self, parent=None, title=""):
         super().__init__(parent)
         self._bar_fitted = False
+        self._centred = False
         self._title = self._close = None
         self.setWindowTitle(title)
         if FRAMELESS:
@@ -553,10 +554,26 @@ class GradientDialog(QDialog):
         if FRAMELESS:
             self._place_chrome()
             set_round_corners(self)
+        if not self._centred:   # every dialog opens in the middle of the screen (later re-fits keep their place)
+            self._centred = True
+            self.centre_on_screen()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._place_chrome()
+
+    def centre_on_screen(self):
+        """Middle of the screen the main window is on (not the middle of the window, which may be half-width).
+        Call from showEvent: the title strip is added as the dialog appears, so its final size is only known then."""
+        layout = self.layout()
+        if layout:
+            layout.activate()
+        self.resize(self.size().expandedTo(self.sizeHint()))   # grow to fit the strip; keep sizes a dialog chose
+        anchor = self.parentWidget() or self
+        screen = (anchor.screen() or QGuiApplication.primaryScreen()).availableGeometry()
+        frame = self.frameGeometry()
+        frame.moveCenter(screen.center())
+        self.move(max(screen.left(), frame.left()), max(screen.top(), frame.top()))
 
     def paintEvent(self, event):
         paint_gradient(self)
