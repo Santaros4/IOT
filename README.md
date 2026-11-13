@@ -30,24 +30,16 @@ A fast workflow focused all-in-one desktop tool for sorting photo collections: b
 
 ## Getting started
 
-**Requirements:** Python 3 (developed on 3.13) and [Pillow](https://pypi.org/project/pillow/).
+**Requirements:** Python 3 (developed on 3.13), [PySide6](https://pypi.org/project/PySide6/) (the Qt window toolkit) and [Pillow](https://pypi.org/project/pillow/). Drag and drop works on every platform with nothing extra to install.
 
 ```bash
-pip install pillow
+pip install PySide6 pillow
 ```
 
-**Tkinter** (the window toolkit) comes with Python on Windows and with the python.org installer on macOS, so there's nothing to install there. On Linux it's often a separate system package:
+**Older Tkinter version:** if PySide6 can't be installed on a computer, the previous version of I.O.T is kept as `scripts/iot_tk.py`. It needs only Pillow (and Tkinter, which comes with Python on Windows and macOS; on Linux it's often the `python3-tk` package), shares the same settings, change log and hub files, and has the same features in a plainer look:
 
 ```bash
-sudo apt install python3-tk        # Debian / Ubuntu / Mint
-sudo dnf install python3-tkinter   # Fedora
-sudo pacman -S tk                  # Arch
-```
-
-**Optional, macOS / Linux only:** [tkinterdnd2](https://pypi.org/project/tkinterdnd2/) adds [drag and drop](#drag-and-drop-and-half-window-mode) (dragging a folder from your file manager onto the window to open it). Windows has this built in. Without it everything else works normally.
-
-```bash
-pip install tkinterdnd2
+python scripts/iot_tk.py
 ```
 
 **Running it:**
@@ -153,7 +145,7 @@ range is moved into a new folder of that name inside the current folder. The nam
 ### Group mode
 
 Press **G** (or the **Group** button) to select any pictures, not just a range. The Group button gets an
-animated border while group mode is on, and selected pictures are outlined in dark blue. Click a picture again to un-pick it.
+animated border while group mode is on, and selected pictures are outlined in purple. Click a picture again to un-pick it.
 
 ![Group mode with four pictures picked](docs/group-mode.png)
 
@@ -209,7 +201,8 @@ Every image in the folder is compared with the base image, and any matches are s
 - A folder without sub-folders opens directly if it's inside the current hub; otherwise it becomes the new hub.
 
 The **tab on the left edge** of the grid shrinks the window to the right half of the screen (and back),
-leaving room for a File Manager to drag from. The toolbar wraps onto extra rows to fit.
+leaving room for a File Manager to drag from. In the narrower window the folder box moves onto its own row,
+the toolbar wraps onto extra rows, and the tool buttons drop their key hints (hover a button to see its key).
 
 ![Half-window mode](docs/half-window.png)
 
@@ -282,7 +275,7 @@ Project layout:
 
 ```
 iot.py            the program (run this)
-scripts\          its modules, and the thumbnail pre-cacher
+scripts\          its modules, the thumbnail pre-cacher, and the older Tkinter version (iot_tk.py)
 docs\             screenshots for this README
 ```
 
@@ -309,15 +302,13 @@ I.O.T is developed and tested on **Windows 10/11**, and runs on **Linux** and **
 - Shortcuts follow Mac conventions: **Cmd** wherever Windows uses Ctrl (Click, **Cmd+Click** to rename a range, **Cmd+Z** to undo, **Hover + Cmd** in the folder list) and **Option** for Alt (Click, **Option+Click** to delete a range). Settings shows the Mac names.
 - Right-click (or Ctrl+Click) opens the menus. The **delete** key (Backspace) deletes the picture under the pointer.
 - The frosted background behind the Zoom preview needs **Screen Recording** permission (System Settings → Privacy & Security). Without it you just see the desktop picture behind the preview; it can be turned off in Settings.
-- Drag and drop needs the optional `tkinterdnd2` package.
 
 **Linux**
 
-- Drag and drop needs the optional `tkinterdnd2` package.
 - Some window managers use **Alt+drag** to move windows, which stops Alt+Click reaching I.O.T. If range delete doesn't respond, change that window-manager shortcut (often to the Super key).
 - The frosted Zoom background works on X11; on Wayland the preview opens without it.
-- Folder flags use plain symbols (◎ ! ⚑) instead of colour emoji, which can crash Tk on Linux.
-- The themed title bar and the hidden-file attribute are Windows features; elsewhere I.O.T's own files are hidden by their names starting with a dot.
+- Folder flags use plain symbols (◎ ! ⚑) instead of colour emoji, which aren't installed on every Linux desktop (and can crash the older Tkinter version).
+- The hidden-file attribute is a Windows feature; elsewhere I.O.T's own files are hidden by their names starting with a dot.
 
 ## License & Disclaimer
 

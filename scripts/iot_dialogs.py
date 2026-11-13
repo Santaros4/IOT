@@ -1,6 +1,3 @@
-import tkinter as tk
-
-import iot_theme
 import iot_platform
 
 SHORTCUTS = (
@@ -31,6 +28,8 @@ FLAGS = (  # (setting key, symbol, explanation); symbols differ on Linux, see io
 
 def show_controls_settings_window(app_instance):
     """Shortcuts reference and processing settings, styled to the active theme."""
+    import tkinter as tk          # Tk version only; the Qt Settings window is in iot_qt_dialogs
+    import iot_theme
     app = app_instance
     t = app.theme
     win = iot_theme.make_dialog(app, "Settings")

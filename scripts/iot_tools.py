@@ -1,11 +1,8 @@
 import os
 import threading
-import tkinter as tk
-from tkinter import ttk
 from concurrent.futures import ThreadPoolExecutor
 from PIL import Image
 
-import iot_theme
 import iot_history
 import iot_utils
 
@@ -118,6 +115,9 @@ def run_image_resizer_thread(app_instance, mode="down", folders=None):
     list); by default just the folder on screen. Images are resized in place and keep their names.
     Work runs on background threads so the window stays responsive.
     """
+    import tkinter as tk          # Tk version only (the Qt version has its own dialogs: iot_qt_dialogs)
+    from tkinter import ttk
+    import iot_theme
     app = app_instance
     t = app.theme
     if getattr(app, 'busy', False):
