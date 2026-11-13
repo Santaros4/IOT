@@ -17,8 +17,8 @@ import iot_platform
 import iot_tools
 import iot_utils
 from iot_dialogs import FLAGS, SHORTCUTS
-from iot_qt import (P, GradientDialog, MessageDialog, button, caps, half_tab_pixmap, keycap, label, pil_to_pixmap,
-                    transparent_box)
+from iot_qt import (P, GradientDialog, MessageDialog, button, caps, half_tab_pixmap, keycap, label, paint_gradient,
+                    pil_to_pixmap, transparent_box)
 
 
 def _buttons_row(*widgets):
@@ -516,38 +516,40 @@ class _DupTile(QFrame):
 
 
 class DuplicatesViewer(QWidget):
-    """Full screen, dark: the base image and its matches side by side. Click one to jump to it; Esc or a click
-    on the background closes."""
+    """Full screen, on the app's gradient: the base image and its matches side by side, each on a panel.
+    Click one to jump to it; Esc, Close or a click on the background closes."""
 
     def __init__(self, app, paths):
         super().__init__(None, Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
         self.app = app
         self.setWindowTitle("Duplicates")
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        self.setStyleSheet("QWidget#dupviewer { background: #0c0c0d; }"
-                           "QLabel { color: #e7e8ea; background: transparent; }"
-                           "QFrame#duptile { background: #141416; border: 1px solid #2c2f35; border-radius: 14px; }"
-                           f"QFrame#duptile:hover {{ border: 1px solid {P['accent']}; }}")
-        self.setObjectName("dupviewer")
-        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
         screen = app.screen() or QGuiApplication.primaryScreen()
         area = screen.geometry()
         ratio = screen.devicePixelRatio()
         self.setGeometry(area)
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(20, 0, 20, 20)
-        outer.setSpacing(16)
-        banner = QLabel(f"{len(paths)} matching images  ·  click one to jump to it  ·  Esc to close")
-        banner.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        banner.setStyleSheet("background: #17181b; font-weight: 700; padding: 12px; border-bottom-left-radius: 12px;"
-                             "border-bottom-right-radius: 12px;")
-        outer.addWidget(banner)
+        outer.setContentsMargins(34, 28, 34, 30)
+        outer.setSpacing(22)
+
+        # header: what this is, how to use it, and Close
+        head = QHBoxLayout()
+        head.setSpacing(16)
+        titles = QVBoxLayout()
+        titles.setSpacing(2)
+        titles.addWidget(label("Duplicates", "h2"))
+        titles.addWidget(label(f"{len(paths)} matching images (98%+ match with the base image)  ·  click one to jump "
+                               "to it in the grid  ·  Esc to close", "muted"))
+        head.addLayout(titles, 1)
+        head.addWidget(button("Close", "", "Back to the grid  (Esc)", self.close))
+        outer.addLayout(head)
+
         row = QHBoxLayout()
-        row.setSpacing(20)
+        row.setSpacing(22)
         outer.addLayout(row, 1)
-        tile_w = (area.width() - 60 - 20 * (len(paths) - 1)) // len(paths)
-        tile_h = area.height() - 150
-        for path in paths:
+        tile_w = (area.width() - 68 - 22 * (len(paths) - 1)) // len(paths) - 36
+        tile_h = area.height() - 300
+        for number, path in enumerate(paths):
             try:
                 orig_w, orig_h = iot_utils.read_display_size(path)
                 scale = min(tile_w / orig_w, tile_h / orig_h)
@@ -559,15 +561,26 @@ class DuplicatesViewer(QWidget):
                 continue
             tile = _DupTile(lambda name=os.path.basename(path): self.jump(name))
             box = QVBoxLayout(tile)
-            box.setContentsMargins(10, 10, 10, 8)
+            box.setContentsMargins(18, 16, 18, 16)
+            box.setSpacing(6)
+            tag = caps("Base image" if number == 0 else f"Match {number}")
+            tag.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            box.addWidget(tag)
             picture = QLabel()
             picture.setPixmap(pixmap)
             picture.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            caption = QLabel(f"{os.path.basename(path)}\n{orig_w} × {orig_h}")
-            caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
             box.addWidget(picture, 1)
-            box.addWidget(caption)
+            name = label(os.path.basename(path))
+            name.setStyleSheet("font-weight: 700;")
+            name.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            size = label(f"{orig_w} × {orig_h} px", "muted")
+            size.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            box.addWidget(name)
+            box.addWidget(size)
             row.addWidget(tile, 1)
+
+    def paintEvent(self, event):
+        paint_gradient(self)
 
     def jump(self, name):
         self.close()

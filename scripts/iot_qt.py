@@ -115,6 +115,9 @@ QLabel#tilename[state="hover"] {{ color: {p['text']}; }}
 QLabel#tilename[state="range"] {{ color: {p['accent']}; font-weight: 700; }}
 QLabel#tilename[state="group"] {{ color: {p['group']}; font-weight: 700; }}
 QLabel#tilename[state="dup"] {{ color: {p['danger']}; font-weight: 700; }}
+QFrame#duptile {{ background: {p['row_bg']}; border: 1px solid {p['row_border']}; border-radius: 18px; }}
+QFrame#duptile:hover {{ border: 2px solid {p['accent']}; }}
+QFrame#duptile QLabel {{ background: transparent; border: none; }}
 QFrame#popup {{ background: {p['menu_bg']}; border: 1px solid {p['menu_border']}; border-radius: 12px; }}
 QFrame#treerow {{ background: transparent; border: none; border-radius: 8px; }}
 QFrame#treerow:hover {{ background: {p['btn_hover']}; }}
