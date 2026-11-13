@@ -3065,11 +3065,13 @@ class ImageOrganizationToolkit(QMainWindow):
         for session in [self.session] + [session for session, _ in self._retired_hubs]:
             session.cleanup()           # permanently removes this session's deleted files
         self.check_and_cleanup_cache()
-        self.tip.close()
         self._close_preview()
+        for widget in QApplication.topLevelWidgets():   # the Undo window, duplicates viewer, hover tip...
+            if widget is not self and widget.isVisible():
+                widget.close()
         QApplication.instance().removeEventFilter(self)
         event.accept()
-        QApplication.instance().quit()   # the Undo window may still be open
+        QApplication.instance().quit()
 
     def handle_manual_exit_cleanup(self):   # old name (Tk version)
         self.close()
@@ -3122,6 +3124,15 @@ def create_app():
     return app
 
 
+def finish_qt():
+    """Destroys every remaining window before the process ends. Windows still alive (even hidden ones, such as
+    a closed Undo window waiting to be deleted) made Qt crash while the process was being unloaded."""
+    for widget in QApplication.topLevelWidgets():
+        widget.deleteLater()
+    QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    QApplication.processEvents()
+
+
 def main():
     hook = install_crash_logging()
     try:
@@ -3129,9 +3140,11 @@ def main():
         window = ImageOrganizationToolkit()
         window.showMaximized()
         code = app.exec()
-        # Everything was saved and cleaned up when the window closed. Leave straight away: Python's own
-        # shutdown, tearing down Qt objects while worker threads are still alive, can occasionally crash
-        # (seen once in testing), which would leave a misleading entry in iot_crash.log.
+        # Everything was saved and cleaned up when the window closed. Destroy the windows, then leave straight
+        # away: Python's own shutdown, tearing down Qt objects while worker threads are still alive, can crash,
+        # which would leave a misleading entry in iot_crash.log.
+        del window
+        finish_qt()
         sys.stdout.flush()
         sys.stderr.flush()
         os._exit(code)

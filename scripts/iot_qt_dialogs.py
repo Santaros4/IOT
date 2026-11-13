@@ -17,8 +17,8 @@ import iot_platform
 import iot_tools
 import iot_utils
 from iot_dialogs import FLAGS, SHORTCUTS
-from iot_qt import (P, GradientDialog, MessageDialog, button, caps, half_tab_pixmap, keycap, label, paint_gradient,
-                    pil_to_pixmap, transparent_box)
+from iot_qt import (P, ElidedLabel, GradientDialog, MessageDialog, button, caps, half_tab_pixmap, keycap, label,
+                    paint_gradient, pil_to_pixmap, transparent_box)
 
 
 def _buttons_row(*widgets):
@@ -326,8 +326,11 @@ class UndoWindow(GradientDialog):
         self.scroll.setWidgetResizable(True)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         outer.addWidget(self.scroll, 1)
-        outer.addLayout(_buttons_row(button("Close", callback=self.close)))
-        self.setMinimumWidth(680)
+        outer.addLayout(_buttons_row(button("Close", callback=self.reject)))
+        screen = (app.screen() or QGuiApplication.primaryScreen()).availableGeometry()
+        self.resize(max(760, int(screen.width() * 0.4)), 400)
+        self.setMinimumWidth(640)
+        self._fit_bar()   # room for the title strip now, so the first size already includes it
         self.refresh()
 
     def refresh(self):
@@ -354,15 +357,20 @@ class UndoWindow(GradientDialog):
             badge.setFixedWidth(118)
             badge.setStyleSheet(f"background: {P['accent_soft']}; color: {P['accent']}; border-radius: 8px; padding: 4px;")
             line.addWidget(badge)
+            # One line each, shortened with … (full text in the tooltip): a long title or a deep folder path
+            # mustn't widen the list and push the Revert buttons out of sight
             text, text_box = transparent_box(QVBoxLayout, 2)
-            title = label(record.title, "faint" if record.reverted else "")
-            title.setWordWrap(True)
+            title = ElidedLabel(record.title)
+            if record.reverted:
+                title.setObjectName("faint")
             try:
                 where = os.path.relpath(record.folder, os.path.dirname(app.parent_hub.rstrip("\\/")))
             except ValueError:
                 where = record.folder
+            place = ElidedLabel(f"{app.time_ago(record.time)}  ·  {where}", mode=Qt.TextElideMode.ElideMiddle)
+            place.setObjectName("muted")
             text_box.addWidget(title)
-            text_box.addWidget(label(f"{app.time_ago(record.time)}  ·  {where}", "muted"))
+            text_box.addWidget(place)
             line.addWidget(text, 1)
             if record.reverted:
                 line.addWidget(label("Reverted", "faint"))
@@ -370,20 +378,25 @@ class UndoWindow(GradientDialog):
                 line.addWidget(button("Revert", "small", callback=lambda r=record: app.perform_undo(r)))
             rows.addWidget(row)
         rows.addStretch(1)
+        # The old list may hold the Revert button being clicked right now: hand it over for deletion once the
+        # click has finished (setWidget alone would delete it on the spot, mid-click)
+        old = self.scroll.takeWidget()
+        if old is not None:
+            old.deleteLater()
         self.scroll.setWidget(holder)
         # As tall as the list, up to ~60% of the screen; beyond that it scrolls
         holder.adjustSize()
         screen = (self.screen() or QGuiApplication.primaryScreen()).availableGeometry()
         self.scroll.setFixedHeight(min(holder.sizeHint().height() + 4, int(screen.height() * 0.6)))
-        if self.isVisible():
-            self.adjustSize()
+        self.resize(self.width(), self.sizeHint().height())   # keep the width; fit the height to the list
 
-    def closeEvent(self, event):
-        self.app._undo_window = None
-        super().closeEvent(event)
-
-    def reject(self):     # Esc
-        self.close()
+    def done(self, result):
+        """Every way of closing ends here: Close, Esc and the title-bar X call reject(), and close() goes through
+        reject() too (QDialog). Overriding reject() / closeEvent to call close() instead made Qt ignore the close."""
+        if self.app._undo_window is self:
+            self.app._undo_window = None
+        super().done(result)
+        self.deleteLater()
 
 
 # ==================================================================== resizer (D / U)
