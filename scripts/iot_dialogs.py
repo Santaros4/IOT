@@ -3,12 +3,14 @@ import iot_platform
 SHORTCUTS = (
     ("Click, Click", "Select a range (first and last image) and move into a folder"),
     ("Click, Ctrl+Click", "Instantly rename the selected range, leave in place"),
-    ("Click, Alt+Click", "Delete a range (no confirmation; Undo restores it)"),
-    ("Hover + Delete", "Delete the image under the pointer (no confirmation)"),
+    ("Click, Alt+Click", "Delete a range (Undo restores it; Settings > Confirmations can make it ask first)"),
+    ("Hover + Delete", "Delete the image under the pointer (asks first only if set in Confirmations)"),
     ("Hover + Hold Z", "Full-screen preview of the image under the pointer"),
+    ("Double-click", "Open the image in your default image viewer"),
     ("W / S", "Previous / Next folder"),
     ("Q", "Delete current folder when IOT closes (Q again or Undo keeps it)"),
     ("R", "Rename the current folder"),
+    ("C", "Compress the current folder into a zip (Settings: where it goes)"),
     ("F", "Find duplicates of the base image (98%+ match)"),
     ("D / U", "Downscale / Upscale the folder"),
     ("Folder list: Hover + D / U", "Downscale / Upscale a folder and all its sub-folders"),
@@ -17,6 +19,19 @@ SHORTCUTS = (
     ("Enter", "In group mode: copy selected images into a new folder (also general confirmation)"),
     ("Ctrl+Z", "Undo the most recent change"),
     ("F5", "Refresh: pick up changes made outside I.O.T"),
+)
+
+# Actions that can ask "are you sure?" first (Settings > Confirmations). (key, action, what asking means, default):
+# the defaults are I.O.T's own workflow - quick actions that Undo can reverse don't ask, bigger ones do.
+CONFIRMATIONS = (
+    ("delete_image", "Hover + Delete", "Delete the picture under the pointer", False),
+    ("delete_range", "Click, Alt+Click", "Delete a range of pictures", False),
+    ("rename_range", "Click, Ctrl+Click", "Rename a range in place, using the suggested name", False),
+    ("delete_folder", "Q", "Mark the current folder for deletion when I.O.T closes", True),
+    ("resize", "D / U", "Downscale / Upscale (also Hover + D / U in the folder list)", True),
+    ("rename_branch", "Hover + Ctrl", "Folder list: rename a folder's and its sub-folders' images", True),
+    ("compress", "C", "Compress the current folder into a zip", True),
+    ("undo", "Ctrl+Z", "Undo the most recent change (the Undo window's Revert buttons never ask)", False),
 )
 
 FLAGS = (  # (setting key, symbol, explanation); symbols differ on Linux, see iot_platform

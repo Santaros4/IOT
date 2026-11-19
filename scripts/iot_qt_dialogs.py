@@ -1,22 +1,23 @@
 """
 I.O.T's windows other than the main one, in Qt: Settings, the Undo list, the small prompts, the progress
-window, the resizer (confirmation + progress) and the full-screen duplicates viewer.
+window, the resizer (confirmation + progress), Compress Folder (C) and the full-screen duplicates viewer.
 The shortcut and flag tables shown in Settings are in iot_dialogs.py (shared with the Tk version).
 """
 import os
 import threading
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFontMetrics, QGuiApplication
-from PySide6.QtWidgets import (QCheckBox, QDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
+from PySide6.QtWidgets import (QCheckBox, QDialog, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
                                QProgressBar, QScrollArea, QSlider, QVBoxLayout, QWidget)
 
 import iot_history
 import iot_platform
 import iot_tools
 import iot_utils
-from iot_dialogs import FLAGS, SHORTCUTS
+from iot_dialogs import CONFIRMATIONS, FLAGS, SHORTCUTS
 from iot_qt import (P, ElidedLabel, GradientDialog, MessageDialog, button, caps, half_tab_pixmap, keycap, label,
                     paint_gradient, pil_to_pixmap, transparent_box)
 
@@ -207,6 +208,32 @@ class SettingsDialog(GradientDialog):
         self.exif.setToolTip("Removes information like Camera model & GPS co-ords, leave unchecked if unsure")
         right.addWidget(self.exif)
         right.addSpacing(10)
+        right.addWidget(caps("Compress folder (C)"))
+        zip_box, zip_row = transparent_box(QHBoxLayout, 8)
+        zip_tip = ("Where the zip made by Compress Folder (C) goes. Leave it empty to put the zip next to the folder "
+                   "(in the folder above it).")
+        self.zip_dest = QLineEdit(app.zip_destination)
+        self.zip_dest.setPlaceholderText("Next to the folder")
+        self.zip_dest.setClearButtonEnabled(True)
+        self.zip_dest.setMinimumWidth(260)
+        self.zip_dest.setToolTip(zip_tip)
+        zip_label = label("Zips go to")
+        zip_label.setToolTip(zip_tip)
+        zip_row.addWidget(zip_label)
+        zip_row.addWidget(self.zip_dest, 1)
+        zip_row.addWidget(button("Browse…", "small", "Choose the folder for compressed folders", self._browse_zip))
+        right.addWidget(zip_box)
+        right.addSpacing(10)
+        right.addWidget(caps("Confirmations"))
+        self.confirmations = dict(app.confirmations)   # private copy: applied on Save
+        confirm_box, confirm_row = transparent_box(QHBoxLayout, 10)
+        self.confirm_summary = label("", "muted")
+        confirm_row.addWidget(self.confirm_summary, 1)
+        choose = button("Choose…", "small", "Pick which actions ask \"are you sure?\" first", self._choose_confirmations)
+        confirm_row.addWidget(choose)
+        right.addWidget(confirm_box)
+        self._show_confirm_summary()
+        right.addSpacing(10)
         right.addWidget(caps("Display"))
         self.frost = QCheckBox("Frosted screen behind Zoom preview")
         self.frost.setChecked(app.frost_preview)
@@ -279,6 +306,22 @@ class SettingsDialog(GradientDialog):
         self.error.setText(text)
         self.error.show()
 
+    def _show_confirm_summary(self):
+        asking = sum(1 for key, *_ in CONFIRMATIONS if self.confirmations.get(key))
+        self.confirm_summary.setText(f"{asking} of {len(CONFIRMATIONS)} actions ask first")
+
+    def _choose_confirmations(self):
+        dialog = ConfirmationsDialog(self, self.confirmations)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.confirmations = dialog.result_values()
+            self._show_confirm_summary()
+
+    def _browse_zip(self):
+        start = self.zip_dest.text().strip() or os.path.dirname(self.app.image_folder.rstrip("\\/"))
+        chosen = QFileDialog.getExistingDirectory(self, "Where should compressed folders go?", start)
+        if chosen:
+            self.zip_dest.setText(os.path.normpath(chosen))
+
     def save(self):
         app, edits = self.app, self.edits
         try:
@@ -294,6 +337,13 @@ class SettingsDialog(GradientDialog):
         if anomaly < 0:
             self._fail("Unusual size threshold needs to be 100 or more (100 = the average folder size).")
             return
+        zip_dest = self.zip_dest.text().strip().strip('"')
+        if zip_dest and not os.path.isdir(zip_dest):
+            self._fail("The folder for compressed folders doesn't exist. Choose one with Browse, or leave it empty "
+                       "to put zips next to the folder.")
+            return
+        app.zip_destination = os.path.normpath(zip_dest) if zip_dest else ""
+        app.confirmations = dict(self.confirmations)
         app.anomaly_threshold_var.set(f"{anomaly:g}")
         app.down_target, app.up_target, app.jpg_quality = down, up, quality
         app.target_resolution, app.base_image = resolution, base
@@ -306,6 +356,57 @@ class SettingsDialog(GradientDialog):
         app.save_settings()
         self.accept()
         app.handle_anomaly_recalculation_event()
+
+
+class ConfirmationsDialog(GradientDialog):
+    """Settings > Confirmations: one tick box per action that changes files. Ticked = asks "are you sure?" first."""
+
+    def __init__(self, parent, values):
+        super().__init__(parent, "Confirmations")
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(28, 14, 28, 22)
+        outer.setSpacing(12)
+        outer.addWidget(label("Tick an action to have it ask \"are you sure?\" before it changes anything. Untick it to "
+                              "skip the question. Undo can reverse every one of them until I.O.T closes.", "muted",
+                              wrap=True))
+        box = QFrame()
+        box.setObjectName("info")
+        grid = QGridLayout(box)
+        grid.setContentsMargins(18, 14, 18, 14)
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(10)
+        self.boxes = {}
+        for row, (key, keys, text, default) in enumerate(CONFIRMATIONS):
+            tick = QCheckBox()
+            tick.setChecked(bool(values.get(key, default)))
+            tick.setCursor(Qt.CursorShape.PointingHandCursor)
+            tick.setToolTip("Ask first" if not default else "Ask first (on by default)")
+            self.boxes[key] = tick
+            grid.addWidget(tick, row, 0)
+            grid.addWidget(keycap(iot_platform.keys(keys)), row, 1, Qt.AlignmentFlag.AlignLeft)
+            grid.addWidget(label(iot_platform.keys(text)), row, 2)
+            grid.addWidget(label("asks by default" if default else "doesn't ask by default", "faint"), row, 3)
+        grid.setColumnStretch(2, 1)
+        outer.addWidget(box)
+        presets = QHBoxLayout()
+        presets.setSpacing(8)
+        for text, tip, choose in (("All on", "Every action asks first", lambda key, default: True),
+                                  ("All off", "No action asks first (Undo still works)", lambda key, default: False),
+                                  ("Defaults", "I.O.T's own choice: the quick, undoable actions don't ask",
+                                   lambda key, default: default)):
+            presets.addWidget(button(text, "small", tip, lambda c=choose: self._set_all(c)))
+        presets.addStretch(1)
+        outer.addLayout(presets)
+        done = button("Done", "primary", callback=self.accept)
+        done.setDefault(True)
+        outer.addLayout(_buttons_row(button("Cancel", callback=self.reject), done))
+
+    def _set_all(self, choose):
+        for key, _, _, default in CONFIRMATIONS:
+            self.boxes[key].setChecked(choose(key, default))
+
+    def result_values(self):
+        return {key: box.isChecked() for key, box in self.boxes.items()}
 
 
 # ==================================================================== Undo list
@@ -441,7 +542,7 @@ def run_resizer(app, mode="down", folders=None):
     text = (f"{word} {len(files)} {'image' if len(files) == 1 else 'images'}{in_folders}?\n\n"
             f"Images in {where} will be resized in place, names unchanged, so their short edge is {target} px"
             f"{' (only ones larger than that)' if mode == 'down' else ' (only ones smaller than that)'}.")
-    if not confirm(app, f"{word} images", text, word, rows=rows):
+    if app.asks("resize") and not confirm(app, f"{word} images", text, word, rows=rows):
         return
 
     app.busy = True
@@ -509,6 +610,186 @@ def run_resizer(app, mode="down", folders=None):
         if tally["failed"]:
             message += f", {tally['failed']} failed (unreadable or locked)"
         app.log_status(message + ".", "error" if tally["failed"] else "success")
+
+    timer.timeout.connect(poll)
+    timer.start()
+
+
+# ==================================================================== Compress Folder (C)
+
+# Already compressed: zipping them again takes far longer for next to no saving, so they're stored as they are
+ALREADY_COMPRESSED = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic", ".heif", ".avif", ".jxl", ".zip", ".7z",
+                      ".rar", ".gz", ".mp4", ".mov", ".mkv", ".avi", ".webm", ".mp3", ".m4a", ".flac", ".pdf"}
+
+
+def _size_text(count):
+    for unit in ("B", "KB", "MB", "GB"):
+        if count < 1024 or unit == "GB":
+            return f"{count:.0f} {unit}" if unit == "B" else f"{count:.1f} {unit}"
+        count /= 1024.0
+
+
+def zip_name_for(folder_name, destination):
+    """The zip's name (without .zip): the folder's own name, or, if a zip of that name is already there, the name
+    with letters taken off the end one at a time ('Kyoto' -> 'Kyot' -> 'Kyo'...) until it's free."""
+    name = folder_name
+    while name:
+        if not os.path.lexists(os.path.join(destination, name + ".zip")):
+            return name
+        name = name[:-1].rstrip(" .")   # Windows doesn't allow names ending in a space or a dot
+    number = 2                          # every shortened name is taken too (very unlikely): number it instead
+    while os.path.lexists(os.path.join(destination, f"{folder_name} ({number}).zip")):
+        number += 1
+    return f"{folder_name} ({number})"
+
+
+def _folder_contents(folder):
+    """Every file and sub-folder inside `folder`, leaving out hidden ones: I.O.T's own (thumbnail cache, recycle
+    folder, tags, files mid-write) and system clutter such as .DS_Store."""
+    files, folders = [], []
+    for root, dirs, names in os.walk(folder):
+        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+        folders.extend(os.path.join(root, d) for d in dirs)
+        files.extend(os.path.join(root, n) for n in sorted(names) if not n.startswith("."))
+    return files, folders
+
+
+def _write_zip(temp_path, folder, files, folders, progress, cancel_event):
+    """Worker thread: writes the zip. Paths inside it start with the folder's name, so unzipping gives the folder
+    back. Returns ('done' | 'cancelled' | 'failed', [files that couldn't be read], error text)."""
+    top = os.path.basename(folder.rstrip("\\/")) or "Folder"
+    skipped = []
+
+    def inside(path):
+        return top + "/" + os.path.relpath(path, folder).replace(os.sep, "/")
+    try:
+        with zipfile.ZipFile(temp_path, "w", allowZip64=True) as archive:
+            archive.writestr(zipfile.ZipInfo(top + "/"), "")
+            for path in folders:   # empty sub-folders are kept too
+                archive.writestr(zipfile.ZipInfo(inside(path) + "/"), "")
+            for path in files:
+                if cancel_event.is_set():
+                    return "cancelled", skipped, ""
+                stored = os.path.splitext(path)[1].lower() in ALREADY_COMPRESSED
+                try:
+                    archive.write(path, inside(path),
+                                  compress_type=zipfile.ZIP_STORED if stored else zipfile.ZIP_DEFLATED,
+                                  compresslevel=None if stored else 6)
+                    progress["bytes"] += os.path.getsize(path)
+                except OSError as err:
+                    skipped.append(f"{os.path.basename(path)}: {err.strerror or err}")
+                progress["files"] += 1
+    except Exception as err:   # disk full, destination gone...
+        return "failed", skipped, str(err) or err.__class__.__name__
+    return "done", skipped, ""
+
+
+def _remove_quietly(path):
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def run_compress(app):
+    """C / Compress Folder: a zip of the folder on screen (the folder itself, everything in it and its sub-folders),
+    named after the folder, saved where Settings says (or next to the folder). Asks first; Undo deletes the zip."""
+    if app.busy:
+        return
+    folder = app.image_folder
+    top = os.path.basename(folder.rstrip("\\/")) or folder
+    files, folders = _folder_contents(folder)
+    if not files:
+        notice(app, "Compress folder", f"'{top}' has no files to compress.")
+        return
+    total_bytes = 0
+    for path in files:
+        try:
+            total_bytes += os.path.getsize(path)
+        except OSError:
+            pass
+
+    chosen = app.zip_destination
+    destination = chosen if chosen and os.path.isdir(chosen) else os.path.dirname(folder.rstrip("\\/"))
+    name = zip_name_for(top, destination)
+    final_path = os.path.join(destination, name + ".zip")
+    contents = f"{len(files)} file{'s' if len(files) != 1 else ''} ({_size_text(total_bytes)})"
+    if folders:
+        contents += f" in {len(folders) + 1} folders"
+    rows = [("Contents", contents), ("Saved as", final_path)]
+    if name != top:
+        rows.append(("", f"'{top}.zip' is already there, so letters were taken off the end of the name"))
+    if chosen and destination != chosen:
+        rows.append(("", f"The folder chosen in Settings isn't available ({chosen}), so the zip goes next to "
+                         "the folder instead"))
+    rows += [("Compression", "Pictures are stored as they are (they're compressed already); other files are "
+                             "compressed"),
+             ("Undo", "Deletes the zip. The folder itself isn't changed")]
+    text = (f"Compress '{top}'?\n\nEverything in the folder, including its sub-folders, goes into one zip file, with "
+            "the folder itself inside it.")
+    if app.asks("compress") and not confirm(app, "Compress folder", text, "Compress", rows=rows):
+        return
+
+    app.busy = True
+    cancel_event = threading.Event()
+    progress = {"files": 0, "bytes": 0}
+    temp_path = os.path.join(destination, f".iot_zip_{os.getpid()}_{name}.tmp")   # hidden from scans until done
+    result = {}
+
+    def cancel():
+        cancel_event.set()
+        window.set_value(window.bar.value(), "Cancelling…")
+
+    window = ProgressDialog(app, f"Compressing '{top}'…", f"0 of {len(files)} files", max(1, total_bytes), cancel)
+    window.bar.setRange(0, max(1, total_bytes // 1024))   # KB, so very large folders still fit the bar's range
+    window.show()
+    worker = threading.Thread(target=lambda: result.update(zip(("status", "skipped", "error"), _write_zip(
+        temp_path, folder, files, folders, progress, cancel_event))), daemon=True, name="iot-zip")
+    worker.start()
+    timer = QTimer(window, interval=100)
+
+    def poll():
+        if not cancel_event.is_set():
+            window.set_value(progress["bytes"] // 1024, f"{progress['files']} of {len(files)} files  ·  "
+                                                         f"{_size_text(progress['bytes'])} of {_size_text(total_bytes)}")
+        if worker.is_alive():
+            return
+        timer.stop()
+        finish()
+
+    def finish():
+        window.finish()
+        app.busy = False
+        status, skipped, error = result.get("status", "failed"), result.get("skipped", []), result.get("error", "")
+        if status != "done":
+            _remove_quietly(temp_path)
+            if status == "cancelled":
+                app.log_status("Compress cancelled: no zip was made.", "info")
+            else:
+                notice(app, "Couldn't compress the folder", f"The zip of '{top}' couldn't be written:\n{error}",
+                       kind="error")
+            return
+        target = os.path.join(destination, zip_name_for(top, destination) + ".zip")   # in case one appeared meanwhile
+        try:
+            os.replace(temp_path, target)
+        except OSError as err:
+            _remove_quietly(temp_path)
+            notice(app, "Couldn't compress the folder", f"The zip couldn't be saved as {target}:\n{err}", kind="error")
+            return
+        undo_keys = iot_platform.keys("Ctrl+Z")
+        log_lines = [f"{contents}  ->  {target}"]
+        if skipped:
+            log_lines.append(f"{len(skipped)} file(s) couldn't be read and were left out: " + "; ".join(skipped[:5]))
+        app._record("Compress", f"Compressed '{top}' into '{os.path.basename(target)}'", folder,
+                    [("created", target)], log_lines, target=destination)
+        app.refresh_folders([destination])   # only re-read if it's a folder in the hub
+        app.refresh_folder_button()
+        if skipped:
+            app.log_status(f"Compressed '{top}', but {len(skipped)} file(s) couldn't be read and were left out: "
+                           f"{skipped[0]}", "warning")
+        else:
+            app.log_status(f"Compressed '{top}' into {target}  ({undo_keys} deletes the zip)", "success")
 
     timer.timeout.connect(poll)
     timer.start()

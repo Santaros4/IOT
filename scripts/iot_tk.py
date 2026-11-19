@@ -522,7 +522,9 @@ class DarkGridImageSorter:
                 on_disk = {}
             if isinstance(on_disk, dict):
                 for key, value in on_disk.items():
-                    if key in data and key in base and data[key] == base[key]:
+                    if key not in data:
+                        data[key] = value  # a setting only the Qt version uses (zip folder, confirmations): keep it
+                    elif key in base and data[key] == base[key]:
                         data[key] = value  # unchanged here: keep the other window's value
         temp = SETTINGS_FILE + ".tmp"
         try:

@@ -64,14 +64,14 @@ Supported formats: **JPEG, PNG, WebP and BMP**.
 ## The window
 
 - **Folder box** (top centre): where you are in the hub, the folder's tag and flags, and its image count and size. A `Σ` total is added when sub-folders hold images too. Click it to open the [folder list](#the-folder-list).
-- **Options:** *Sequential Rename*, *Skip Folder Creation* and *Disable Cache Deletion* (see
+- **Options:** *Seq. Rename* (Sequential Rename), *Skip Folder Creation* and *Cache Deletion* (see
   [Sorting pictures](#sorting-pictures) and [Files I.O.T creates](#files-iot-creates)).
 - **Tools:** the main actions, each with its keyboard shortcut.
 - **Zoom:** thumbnail size slider, and **Fit**, which picks the size that fills the window width.
 - **Undo / Change Log / Settings**, **Refresh (F5)** and a **light / dark theme** switch. Refresh picks up changes made outside I.O.T (in a file manager, say): it re-reads the folder tree and reloads the current folder without losing your place.
 - **Status bar:** messages, the current range selection, and the folder's image count and size.
 
-Right-clicking the grid opens a menu with the same tools, the options, *Jump to Top / Middle / Bottom* and grid zoom presets.
+Right-clicking the grid opens a menu with Settings, Undo, the Change Log and Refresh, then three sub-menus (*Grid Zoom* presets, *Jump* to the top, middle or bottom, and *Tools* with every tool) and the options.
 
 The Light theme:
 
@@ -84,6 +84,8 @@ Only the thumbnails on (and just around) the screen are loaded, so folders with 
 ### Zoom preview
 
 Hover over a picture and **hold Z** for a full-screen view of it. Let go to return. The rest of the screen is frosted while the preview is open (this can be turned off in Settings).
+
+**Double-click** a picture to open it in your computer's default image viewer (to edit it, say). The double-click doesn't select anything: the picture isn't left marked as the start of a range or as a group pick.
 
 ![Zoom preview with the frosted background](docs/zoom-preview.png)
 
@@ -130,9 +132,9 @@ range is moved into a new folder of that name inside the current folder. The nam
 
 ![The first picture of a range, selected](docs/range-start.png)
 
-- **Sequential Rename** (on by default) also renames the moved files `<folder name> - 01`, `- 02`, …
+- **Sequential Rename** (*Seq. Rename* in Options, on by default) also renames the moved files `<folder name> - 01`, `- 02`, …
 - **Skip Folder Creation** renames the range in place instead of moving it into a folder.
-- **Ctrl+Click** as the second click renames the range in place straight away, using the suggested name, with no prompt.
+- **Ctrl+Click** as the second click renames the range in place straight away, using the suggested name, with no prompt (Settings > [Confirmations](#confirmations) can make it ask first).
 - To rename whole folders at once, open the [folder list](#the-folder-list), **hover over a folder and tap Ctrl**:
   every image in that folder and all its sub-folders is renamed after its own folder (`Day 01 - 01.jpg`,`Day 01 - 02.jpg`…, in the current order) and left in place, after a confirmation. One Undo reverses it.
 
@@ -141,6 +143,7 @@ range is moved into a new folder of that name inside the current folder. The nam
 - **Hover + Delete** removes the picture under the pointer.
 - **Click** the first picture, then **Alt+Click** the last, to delete a whole range (no confirmation, since
   Undo brings it back). The grid then scrolls so the next picture after the range is at the top.
+- Neither asks first by default: Settings > [Confirmations](#confirmations) can make them ask first.
 
 ### Group mode
 
@@ -158,6 +161,7 @@ Press **Enter** to **copy** the selected pictures (names unchanged) into a new f
 
 | Tool | Key | What it does |
 |---|---|---|
+| Compress Folder | **C** | Makes a zip of the current folder, named after it (see below). |
 | Delete Folder | **Q** | Marks the current folder for deletion. It's deleted when I.O.T closes; until then it's crossed out, and **Q** again or **Undo** keeps it. Asks first. |
 | Downscale | **D** | Shrinks images so their short edge is your *Downscale* size (only images larger than that). |
 | Find Dupe | **F** | Finds near-identical copies (98%+ match) of the folder's base image. |
@@ -183,6 +187,12 @@ Every image in the folder is compared with the base image, and any matches are s
 
 ![Duplicates of the base image](docs/duplicates.png)
 
+### Compress Folder
+
+Press **C** (or **Compress Folder**) to make a zip of the folder you're in: the folder itself goes inside the zip, with everything in it, sub-folders included. It's named after the folder (`Day 02 Kyoto.zip`); if a zip of that name is already there, letters are taken off the end until the name is free (`Day 02 Kyot.zip`). You see what will go in and where it will be saved before anything happens, and the folder itself is never changed.
+
+The zip goes next to the folder, or to the folder chosen under *Compress folder* in [Settings](#settings). Pictures are stored as they are, since JPEG, PNG and WebP are already compressed (zipping them again would take much longer for next to no saving); other files are compressed. I.O.T's own hidden files (thumbnail cache, recycle folder, tags) are left out. **Undo** deletes the zip.
+
 ---
 
 ## Undo, recycle and the change log
@@ -202,7 +212,7 @@ Every image in the folder is compared with the base image, and any matches are s
 
 The **tab on the left edge** of the grid shrinks the window to the right half of the screen (and back),
 leaving room for a File Manager to drag from. In the narrower window the folder box moves onto its own row,
-the toolbar wraps onto extra rows, and the tool buttons drop their key hints (hover a button to see its key).
+the toolbar wraps onto extra rows, and the tool buttons drop their key hints (hover a button to see its key) and the Zoom reminder.
 
 ![Half-window mode](docs/half-window.png)
 
@@ -222,8 +232,28 @@ the toolbar wraps onto extra rows, and the tool buttons drop their key hints (ho
 | Downscale / Upscale short edge to   | The sizes the resize tools aim for (see Target resolution)                                                                                                                                |
 | JPEG quality                        | Used when resizing (90 gives much smaller file sizes with no visually noticeable drop in quality)                                                                                         |
 | Strip EXIF data from resized images | Removes camera model, GPS position and so on (accounts for rotation)                                                                                                                      |
+| Compress folder: Zips go to         | Where Compress Folder (C) saves zips. Leave it empty to save them next to the folder                                                                                                      |
 
 **Display:** frosted Zoom background, folder sizes in the folder list, and mouse-wheel scroll speed.
+
+### Confirmations
+
+Not everyone wants the same workflow, so you choose which actions ask "are you sure?" first. Settings shows how many do; **Choose…** lists them, each with a tick box, plus **All on**, **All off** and **Defaults**. Changes apply when Settings is saved.
+
+| Action | Asks first by default |
+|---|---|
+| Hover + Delete (one picture) | No |
+| Click, Alt+Click (delete a range) | No |
+| Click, Ctrl+Click (rename a range in place) | No |
+| Q (delete the folder when I.O.T closes) | Yes |
+| D / U (resize, also Hover + D / U in the folder list) | Yes |
+| Hover + Ctrl in the folder list (rename a branch) | Yes |
+| C (compress the folder) | Yes |
+| Ctrl+Z (undo the latest change) | No |
+
+The defaults keep the quick actions quick: every one of these can be undone until I.O.T closes. The name boxes (moving a range, Group copy, Rename Folder) always appear, since they ask for a name rather than a yes or no.
+
+![Choosing which actions ask first](docs/confirmations.png)
 
 **Folder flags:** tick boxes to show or hide each flag.
 
@@ -236,13 +266,15 @@ Settings are saved in `iot_settings.json` next to `iot.py`. If several I.O.T win
 | Keys                       | Action                                                                                             |
 | -------------------------- | -------------------------------------------------------------------------------------------------- |
 | Click, Click               | Select a range (first and last image) and move it into a folder                                    |
-| Click, Ctrl+Click          | Rename the selected range in place, no prompt                                                      |
-| Click, Alt+Click           | Delete a range (no prompt, Undo restores it)                                                       |
-| Hover + Delete             | Delete the image under the pointer (no prompt)                                                     |
+| Click, Ctrl+Click          | Rename the selected range in place, no prompt (unless set in Confirmations)                        |
+| Click, Alt+Click           | Delete a range (no prompt unless set in Confirmations; Undo restores it)                           |
+| Hover + Delete             | Delete the image under the pointer (no prompt unless set in Confirmations)                         |
 | Hover + Hold Z             | Full-screen preview of the image under the pointer                                                 |
+| Double-click               | Open the image in your default image viewer                                                        |
 | W / S                      | Previous / next folder                                                                             |
 | Q                          | Delete the current folder when I.O.T closes (Q again or Undo keeps it)                             |
 | R                          | Rename the current folder                                                                          |
+| C                          | Compress the current folder into a zip                                                             |
 | F                          | Find duplicates of the base image                                                                  |
 | D / U                      | Downscale / upscale the folder                                                                     |
 | Folder list: Hover + D / U | Downscale / upscale a folder and all its sub-folders (used in folder list)                         |
@@ -262,7 +294,7 @@ Settings are saved in `iot_settings.json` next to `iot.py`. If several I.O.T win
 |---|---|---|
 | Next to `iot.py` | `iot_settings.json` | Your settings |
 | Next to `iot.py` | `iot_change_log.txt` | Record of every change (rotated at 5 MB) |
-| In the hub (hidden) | `.thumbs_cache\` | Thumbnail cache. Deleted when I.O.T closes unless *Disable Cache Deletion* is ticked (the default); trimmed when it grows past ~3 GB |
+| In the hub (hidden) | `.thumbs_cache\` | Thumbnail cache. Deleted when I.O.T closes while *Cache Deletion* is ticked (the default); untick it to keep the cache, so folders you've opened before load faster. A kept cache is trimmed when it grows past ~3 GB |
 | In the hub (hidden) | `.iot_recycle\` | Deleted pictures and resize originals, until I.O.T closes |
 | In the hub (hidden) | `.iot_tags.json` | Folder tags |
 
@@ -289,7 +321,7 @@ docs\             screenshots for this README
 python scripts\iot_precache.py "D:\Pictures\Hub"
 ```
 
-Options: `--workers N`, `--clean-old`, `--no-pause` (for Task Scheduler) and `--normal-priority` (it runs at low priority by default). It can be stopped at any time and carries on where it left off next time. Keep *Disable Cache Deletion* ticked in I.O.T, or the cache is deleted when I.O.T closes.
+Options: `--workers N`, `--clean-old`, `--no-pause` (for Task Scheduler) and `--normal-priority` (it runs at low priority by default). It can be stopped at any time and carries on where it left off next time. Untick *Cache Deletion* in I.O.T first, or the cache is deleted when I.O.T closes.
 
 ---
 

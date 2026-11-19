@@ -70,6 +70,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QFrame, QHBoxLayout, QLa
                                QMenu, QScrollArea, QScrollBar, QSlider, QVBoxLayout, QWidget)
 
 import iot_utils  # noqa: E402
+import iot_dialogs  # noqa: E402  (the SHORTCUTS / FLAGS / CONFIRMATIONS tables)
 import iot_history  # noqa: E402
 import iot_platform  # noqa: E402
 import iot_qt  # noqa: E402
@@ -476,6 +477,18 @@ class ThumbGrid(QWidget):
             event.accept()
             return
         super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        """A quick double-click opens the picture in the default image viewer (as in V.O.T). Only a plain one:
+        with Ctrl / Alt held the clicks stay range clicks."""
+        plain = not (event.modifiers() & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier))
+        if event.button() == Qt.MouseButton.LeftButton and plain:
+            idx = self.index_at(event.position().toPoint())
+            if idx is not None:
+                self.app.open_image_externally(idx)
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
 
     def contextMenuEvent(self, event):
         self.app.show_context_menu(event.globalPos())
@@ -939,13 +952,16 @@ class ImageOrganizationToolkit(QMainWindow):
         self.thumb_size = 201
         self.rename_var = Var(True)
         self.skip_folder_var = Var(False)
-        self.keep_cache_var = Var(True)   # "Disable Cache Deletion", on by default
+        self.cache_deletion_var = Var(True)   # "Cache Deletion": the thumbnail cache is deleted on close unless unticked
         self.flags_enabled = {"target": True, "size": True, "modified": True}  # folder flags shown (Settings)
         self.frost_preview = True         # frosted screen behind the Hover + Hold Z preview (Settings)
         self.base_image = 5               # checks use the Nth picture, so covers / thumbnails at the start are skipped
         self.tree_show_sizes = True       # folder sizes in the folder list (Settings)
         self.strip_exif = False           # resized images saved without EXIF (camera model, GPS...) (Settings)
         self.scroll_speed = 100           # % of the normal mouse-wheel step in the picture grid (Settings)
+        self.zip_destination = ""         # where Compress Folder (C) puts zips; empty = next to the folder (Settings)
+        # Which actions ask "are you sure?" first (Settings > Confirmations); defaults are I.O.T's own workflow
+        self.confirmations = {key: default for key, _, _, default in iot_dialogs.CONFIRMATIONS}
         self.theme_name = self.load_settings()
         set_palette(self.theme_name)
         self._settings_base = self._current_settings()  # what was loaded; see save_settings
@@ -976,6 +992,7 @@ class ImageOrganizationToolkit(QMainWindow):
         self.first_selected_idx = None
         self.group_mode = False           # G: pick any pictures, Enter copies them into a folder
         self.group_picks = {}             # filename -> None, in the order they were picked
+        self._click_undo = None           # (index, undo) for the last click that only marked a picture (double-click)
         self.image_cache = OrderedDict()  # (folder, filename, pixel size) -> QPixmap, least recently used first
         self.dims_cache = {}              # (folder, filename) -> original (w, h)
         self._failed_thumbs = set()       # (folder, filename) that couldn't be decoded; not retried
@@ -999,7 +1016,7 @@ class ImageOrganizationToolkit(QMainWindow):
         self._thumb_loader = ThumbnailLoader(self._thumb_queue, worker_count, self.disk_cache)
 
         # Every option change is saved straight away
-        for var in (self.rename_var, self.skip_folder_var, self.keep_cache_var):
+        for var in (self.rename_var, self.skip_folder_var, self.cache_deletion_var):
             var.trace_add("write", lambda *a: self.save_settings())
 
         self._save_soon = QTimer(self, singleShot=True, interval=600)
@@ -1050,12 +1067,21 @@ class ImageOrganizationToolkit(QMainWindow):
             self.thumb_size = max(60, min(300, int(data.get("thumb_size", self.thumb_size))))
             self.rename_var.set(bool(data.get("sequential_rename", True)))
             self.skip_folder_var.set(bool(data.get("skip_folder_creation", False)))
-            self.keep_cache_var.set(bool(data.get("disable_cache_deletion", True)))
+            if "cache_deletion" in data:
+                self.cache_deletion_var.set(bool(data["cache_deletion"]))
+            elif "disable_cache_deletion" in data:   # the old, reversed option: keep what was chosen with it
+                self.cache_deletion_var.set(not bool(data["disable_cache_deletion"]))
             self.frost_preview = bool(data.get("frosted_preview", True))
             self.base_image = max(1, int(data.get("base_image", self.base_image)))
             self.tree_show_sizes = bool(data.get("tree_show_sizes", True))
             self.strip_exif = bool(data.get("strip_exif", False))
             self.scroll_speed = max(50, min(400, round(int(data.get("scroll_speed", 100)) / 10) * 10))  # 50-400% in 10% steps
+            self.zip_destination = str(data.get("zip_destination") or "")
+            saved_confirmations = data.get("confirmations", {})
+            if isinstance(saved_confirmations, dict):
+                for key in self.confirmations:
+                    if key in saved_confirmations:
+                        self.confirmations[key] = bool(saved_confirmations[key])
             saved_flags = data.get("folder_flags", {})
             if isinstance(saved_flags, dict):
                 for key in self.flags_enabled:
@@ -1069,13 +1095,16 @@ class ImageOrganizationToolkit(QMainWindow):
             "theme": getattr(self, "theme_name", "dark"),
             "sequential_rename": self.rename_var.get(),
             "skip_folder_creation": self.skip_folder_var.get(),
-            "disable_cache_deletion": self.keep_cache_var.get(),
+            "cache_deletion": self.cache_deletion_var.get(),
+            "disable_cache_deletion": not self.cache_deletion_var.get(),   # the same, for the Tk version
             "folder_flags": dict(self.flags_enabled),
             "frosted_preview": self.frost_preview,
             "base_image": self.base_image,
             "tree_show_sizes": self.tree_show_sizes,
             "strip_exif": self.strip_exif,
             "scroll_speed": self.scroll_speed,
+            "zip_destination": self.zip_destination,
+            "confirmations": dict(self.confirmations),
             "thumb_size": self.thumb_size,
             "anomaly_threshold": self.anomaly_threshold_var.get(),
             "down_target": self.down_target,
@@ -1101,7 +1130,9 @@ class ImageOrganizationToolkit(QMainWindow):
                 on_disk = {}
             if isinstance(on_disk, dict):
                 for key, value in on_disk.items():
-                    if key in data and key in base and data[key] == base[key]:
+                    if key not in data:
+                        data[key] = value  # a setting this version doesn't use (e.g. the Tk version's): keep it
+                    elif key in base and data[key] == base[key]:
                         data[key] = value  # unchanged here: keep the other window's value
         temp = SETTINGS_FILE + ".tmp"
         try:
@@ -1158,7 +1189,8 @@ class ImageOrganizationToolkit(QMainWindow):
         renamed, since the tree itself changed.
         """
         recycle = iot_history.RECYCLE_DIR_NAME
-        for path in dict.fromkeys(p for p in paths if p and recycle not in os.path.normcase(p)):
+        for path in dict.fromkeys(p for p in paths if p and recycle not in os.path.normcase(p)
+                                  and iot_history._same_or_inside(p, self.parent_hub)):   # outside the hub: not ours
             info = self.folder_info.get(path)
             if info is None or not os.path.isdir(path):
                 self.scan_entire_directory_tree()
@@ -1313,7 +1345,7 @@ class ImageOrganizationToolkit(QMainWindow):
         # toolbar card
         toolbar = card()
         self.toolbar = toolbar
-        self.toolbar_flow = FlowLayout(toolbar, h_spacing=18, v_spacing=10)
+        self.toolbar_flow = FlowLayout(toolbar, h_spacing=14, v_spacing=10)
         self.toolbar_flow.setContentsMargins(16, 12, 16, 12)
         self.toolbar_flow.addWidget(self._options_group())
         self.toolbar_flow.addWidget(self._tools_group())
@@ -1357,11 +1389,13 @@ class ImageOrganizationToolkit(QMainWindow):
         box, row = transparent_box(QHBoxLayout, 9)
         row.addWidget(caps("Options"))
         for text, var, tip in (
-                ("Sequential Rename", self.rename_var, "Moved pictures are renamed '<folder name> - 01', '- 02'..."),
+                ("Seq. Rename", self.rename_var, "Sequential Rename: moved pictures are renamed '<folder name> - 01', "
+                                                 "'- 02'..."),
                 ("Skip Folder Creation", self.skip_folder_var, "A selected range stays in this folder (renamed if "
                                                                "Sequential Rename is on) instead of a new sub-folder"),
-                ("Disable Cache Deletion", self.keep_cache_var, "Keep the thumbnail cache when I.O.T closes, so folders "
-                                                                "open faster next time")):
+                ("Cache Deletion", self.cache_deletion_var, "Delete the thumbnail cache when I.O.T closes. Untick to "
+                                                            "keep it, so folders you've opened before load faster next "
+                                                            "time (and work done by the pre-cacher is kept)")):
             widget = bind_check(QCheckBox(text), var)
             widget.setObjectName("toolcheck")
             widget.setToolTip(tip)
@@ -1376,6 +1410,8 @@ class ImageOrganizationToolkit(QMainWindow):
         row.addSpacing(4)
         # Alphabetical; Group carries the animated border, Zoom is shown as a feature (not clickable)
         for text, key, command, tip in (
+                ("Compress Folder", "C", self.trigger_compress_folder, "Make a zip of this folder, sub-folders "
+                                                                       "included (Settings: where it goes)"),
                 ("Delete Folder", "Q", self.trigger_folder_delete, "Delete this folder when I.O.T closes (Q again or "
                                                                    "Undo keeps it)"),
                 ("Downscale", "D", lambda: self.run_resizer("down"), "Shrink this folder's images (Settings: short edge)"),
@@ -1383,7 +1419,7 @@ class ImageOrganizationToolkit(QMainWindow):
                 ("Group", "G", None, ""),
                 ("Rename Folder", "R", self.trigger_active_folder_rename, "Rename the folder on screen"),
                 ("Upscale", "U", lambda: self.run_resizer("up"), "Enlarge this folder's images (Settings: short edge)"),
-                ("Zoom", "Hover + Hold Z", None, "Hold Z with the pointer over a picture for a full-screen view")):
+                ("Zoom", "Hold Z", None, "Hover over a picture and hold Z for a full-screen view")):
             if text == "Group":
                 self.group_button = GroupButton("Group · G")
                 self.group_button.setObjectName("tool")
@@ -1414,7 +1450,7 @@ class ImageOrganizationToolkit(QMainWindow):
         self.size_slider = QSlider(Qt.Orientation.Horizontal)
         self.size_slider.setRange(60, 300)
         self.size_slider.setValue(self.thumb_size)
-        self.size_slider.setFixedWidth(92)
+        self.size_slider.setFixedWidth(80)
         self.size_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.size_slider.setCursor(Qt.CursorShape.PointingHandCursor)
         self.size_slider.valueChanged.connect(self.on_slider_change)
@@ -1492,6 +1528,8 @@ class ImageOrganizationToolkit(QMainWindow):
         compact = narrow and self.width() < 1100
         for widget, full, short in self._tool_texts:
             widget.setText(short if compact else full)
+            if full.startswith("Zoom"):   # only a reminder of Hold Z, not a button: dropped when space is short
+                widget.setVisible(not compact)
         self._refresh_group_button()
 
     # ------------------------------------------------------------------ status line
@@ -1590,32 +1628,34 @@ class ImageOrganizationToolkit(QMainWindow):
         command("Open Change Log", None, self.open_change_log)
         command("Refresh", "F5", self.refresh)
         menu.addSeparator()
-        command("Jump to Top", None, lambda: self.grid.scroll_to(0))
-        command("Jump to Middle", None, self.handle_jump_to_middle_scroll)
-        command("Jump to Bottom", None, lambda: self.grid.scroll_to(self.grid.scrollbar.maximum()))
-        menu.addSeparator()
+        # Sub-menus (alphabetical) keep the menu short
         zoom = menu.addMenu("Grid Zoom")
         command("Fit to Width", None, self.handle_auto_snap_zoom, zoom)
         zoom.addSeparator()
         for text, value in (("Large (300 px)", 300), ("Medium (180 px)", 180), ("Small (60 px)", 60)):
             command(text, None, lambda v=value: self.size_slider.setValue(v), zoom)
-        menu.addSeparator()
-        command("Delete Folder", "Q", self.trigger_folder_delete)
-        command("Downscale Images", "D", lambda: self.run_resizer("down"))
-        command("Find Duplicates", "F", self.trigger_duplicate_hash_scan)
-        command("Group Select", "G", self.toggle_group_mode)
-        command("Rename Folder", "R", self.trigger_active_folder_rename)
-        command("Upscale Images", "U", lambda: self.run_resizer("up"))
+        jump = menu.addMenu("Jump")
+        command("Top", None, lambda: self.grid.scroll_to(0), jump)
+        command("Middle", None, self.handle_jump_to_middle_scroll, jump)
+        command("Bottom", None, lambda: self.grid.scroll_to(self.grid.scrollbar.maximum()), jump)
+        tools = menu.addMenu("Tools")
+        command("Compress Folder", "C", self.trigger_compress_folder, tools)
+        command("Delete Folder", "Q", self.trigger_folder_delete, tools)
+        command("Downscale Images", "D", lambda: self.run_resizer("down"), tools)
+        command("Find Duplicates", "F", self.trigger_duplicate_hash_scan, tools)
+        command("Group Select", "G", self.toggle_group_mode, tools)
+        command("Rename Folder", "R", self.trigger_active_folder_rename, tools)
+        command("Upscale Images", "U", lambda: self.run_resizer("up"), tools)
         menu.addSeparator()
         self._menu_checks = []
         for text, var in (("Sequential Rename", self.rename_var), ("Skip Folder Creation", self.skip_folder_var),
-                          ("Disable Cache Deletion", self.keep_cache_var)):
+                          ("Cache Deletion", self.cache_deletion_var)):
             action = menu.addAction(text)
             action.setCheckable(True)
             action.triggered.connect(lambda checked, v=var: v.set(checked))
             self._menu_checks.append((action, var))
         # The shortcuts are shown in the menu but handled by eventFilter (single keys, held Z...)
-        for action in menu.actions() + zoom.actions():
+        for action in menu.actions() + zoom.actions() + jump.actions() + tools.actions():
             action.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
 
     def show_context_menu(self, global_pos):
@@ -1663,10 +1703,15 @@ class ImageOrganizationToolkit(QMainWindow):
             self.shift_active_directory_index(-1 if key == K.Key_W else 1)
             return True
         if key == K.Key_Delete or (key == K.Key_Backspace and iot_platform.IS_MAC):  # Mac "delete" is Backspace
-            self.handle_keyboard_delete()
+            if not self.asks("delete_image"):
+                self.handle_keyboard_delete()      # held down: keeps deleting, as before
+            elif not repeat:
+                name = self.hovered_filename
+                later(lambda: self.handle_keyboard_delete(name))
             return True
         actions = {K.Key_D: lambda: self.run_resizer("down"), K.Key_U: lambda: self.run_resizer("up"),
                    K.Key_Q: self.trigger_folder_delete, K.Key_R: self.trigger_active_folder_rename,
+                   K.Key_C: self.trigger_compress_folder,
                    K.Key_F: self.trigger_duplicate_hash_scan, K.Key_G: self.toggle_group_mode,
                    K.Key_Return: self.copy_group_selection, K.Key_Enter: self.copy_group_selection,
                    K.Key_Escape: lambda: self.toggle_group_mode() if self.group_mode else None,
@@ -2264,6 +2309,9 @@ class ImageOrganizationToolkit(QMainWindow):
         if record is None:
             self.log_status("Nothing to undo.", "info")
             return
+        if self.asks("undo") and not self._confirm("Undo", "Undo the most recent change?", f"{record.title}.",
+                                                    "Undo"):
+            return
         self.perform_undo(record)
 
     def perform_undo(self, record):
@@ -2353,13 +2401,19 @@ class ImageOrganizationToolkit(QMainWindow):
 
     # ------------------------------------------------------------------ deleting
 
-    def handle_keyboard_delete(self):
-        """Moves the hovered image to the recycle folder; the following pictures shift up into the gap."""
-        if self.busy or self.hovered_filename is None:
+    def handle_keyboard_delete(self, filename=None):
+        """Moves the hovered image (or `filename`) to the recycle folder; the following pictures shift up into the
+        gap. Asks first if Settings > Confirmations says so."""
+        filename_to_delete = filename or self.hovered_filename
+        if self.busy or filename_to_delete is None:
             return
-        filename_to_delete = self.hovered_filename
         idx = self.file_index.get(filename_to_delete)
         if idx is None:
+            return
+        if self.asks("delete_image") and not self._confirm(
+                "Delete picture", f"Delete '{filename_to_delete}'?",
+                f"It's moved to the recycle folder and only removed when I.O.T closes; Undo ({UNDO_KEYS}) brings it "
+                "back.", "Delete", "danger"):
             return
         folder = self.image_folder
         full_path = os.path.join(folder, filename_to_delete)
@@ -2410,6 +2464,10 @@ class ImageOrganizationToolkit(QMainWindow):
         """Themed single-field prompt. Returns the text, or None if cancelled."""
         self.close_tooltip()
         return dialogs.TextPrompt.ask(self, title, subtitle, field_label, default_value, confirm_text)
+
+    def asks(self, action):
+        """True when this action should ask "are you sure?" first (Settings > Confirmations)."""
+        return self.confirmations.get(action, True)
 
     def _confirm(self, title, heading, text, confirm_text, variant="primary"):
         """Themed yes / no dialog. Returns True when confirmed."""
@@ -2592,7 +2650,7 @@ class ImageOrganizationToolkit(QMainWindow):
         contents = f"{images} image{'s' if images != 1 else ''} ({format_bytes(total_bytes)})"
         if sub_folders:
             contents += f" and {sub_folders} sub-folder{'s' if sub_folders != 1 else ''}"
-        if not self._confirm("Delete folder", f"Delete '{name}'?",
+        if self.asks("delete_folder") and not self._confirm("Delete folder", f"Delete '{name}'?",
                              f"The folder and everything in it, {contents}, will be permanently deleted when I.O.T "
                              "closes. Until then it stays, crossed out in the folder list; press Q again or Undo "
                              f"({UNDO_KEYS}) to keep it.", "Delete", "danger"):
@@ -2643,7 +2701,8 @@ class ImageOrganizationToolkit(QMainWindow):
         top_name = os.path.basename(folders[0].rstrip("\\/")) or folders[0]
         examples = ",  ".join(f"'{first}'" for _, _, _, first in jobs[:3]) + ("  ..." if len(jobs) > 3 else "")
         in_folders = f" in {len(jobs)} folders" if len(jobs) > 1 else ""
-        if not self._confirm("Rename images", f"Rename {total} image{'s' if total != 1 else ''}{in_folders}?",
+        if self.asks("rename_branch") and not self._confirm(
+                "Rename images", f"Rename {total} image{'s' if total != 1 else ''}{in_folders}?",
                              f"Images in '{top_name}'{' and its sub-folders' if len(folders) > 1 else ''} will be renamed "
                              f"after their own folder, in their current order, and left in place: {examples}. "
                              f"Undo ({UNDO_KEYS}) puts the old names back.", "Rename"):
@@ -2691,6 +2750,14 @@ class ImageOrganizationToolkit(QMainWindow):
         if not self.busy:
             self.close_tooltip()
             dialogs.run_resizer(self, mode, folders)
+
+    # ------------------------------------------------------------------ compress folder (C)
+
+    def trigger_compress_folder(self):
+        """C: a zip of the folder on screen (see iot_qt_dialogs.run_compress)."""
+        if not self.busy:
+            self.close_tooltip()
+            dialogs.run_compress(self)
 
     # ------------------------------------------------------------------ duplicate scan
 
@@ -2863,8 +2930,10 @@ class ImageOrganizationToolkit(QMainWindow):
         """mode: 'click' (range into folder), 'ctrl' (range renamed in place), 'alt' (range delete)."""
         if self.busy:
             return
+        self._click_undo = None
         if self.group_mode:  # every kind of click just picks / unpicks in group mode
             self._toggle_group_pick(clicked_idx)
+            self._click_undo = (clicked_idx, lambda: self._toggle_group_pick(clicked_idx))
             return
 
         if mode == "alt":
@@ -2875,6 +2944,14 @@ class ImageOrganizationToolkit(QMainWindow):
             end_range = max(self.first_selected_idx, clicked_idx)
             files_to_delete = self.all_files[start_range:end_range + 1]
             self.close_tooltip()
+            count = len(files_to_delete)
+            if self.asks("delete_range") and not self._confirm(
+                    "Delete pictures", f"Delete {count} picture{'s' if count != 1 else ''}?",
+                    f"{files_to_delete[0]}" + (f"  →  {files_to_delete[-1]}" if count > 1 else "") +
+                    f". They're moved to the recycle folder and only removed when I.O.T closes; Undo ({UNDO_KEYS}) "
+                    "brings them back.", "Delete", "danger"):
+                self._set_selection(None)
+                return
             folder = self.image_folder
             steps, failed = [], 0
             for filename in files_to_delete:
@@ -2900,11 +2977,15 @@ class ImageOrganizationToolkit(QMainWindow):
         # Plain click and Ctrl+click both pick a two-picture range the same way: the first click marks
         # the start, the second click marks the end. Ctrl on the second click renames that range in
         # place (sequential names, no folder, nothing moved) whatever the checkboxes say.
-        if self.first_selected_idx is None:
-            self._set_selection(clicked_idx)
-            return
-        if clicked_idx <= self.first_selected_idx:
-            self._set_selection(clicked_idx if clicked_idx < self.first_selected_idx else None)
+        before = self.first_selected_idx
+        if self.first_selected_idx is None or clicked_idx <= self.first_selected_idx:
+            # Only marks (or unmarks) a picture: remembered, so a double-click can put it back as it was
+            if self.first_selected_idx is None:
+                self._set_selection(clicked_idx)
+            else:
+                self._set_selection(clicked_idx if clicked_idx < self.first_selected_idx else None)
+            if mode == "click":
+                self._click_undo = (clicked_idx, lambda: self._set_selection(before))
             return
         start_idx = self.first_selected_idx
         end_idx = clicked_idx
@@ -2919,6 +3000,13 @@ class ImageOrganizationToolkit(QMainWindow):
             should_rename = True
             is_skip_folder = True
             folder_tag = (self.last_folder_name or "Sequence").strip()
+            count = len(files_to_move)
+            if self.asks("rename_range") and not self._confirm(
+                    "Rename pictures", f"Rename {count} picture{'s' if count != 1 else ''} as '{folder_tag} - ##'?",
+                    f"{files_to_move[0]}  →  {files_to_move[-1]} are renamed '{folder_tag} - 01', '- 02'... and left "
+                    f"in this folder. Undo ({UNDO_KEYS}) puts the old names back.", "Rename"):
+                self._set_selection(None)
+                return
         else:
             should_rename = self.rename_var.get()
             is_skip_folder = self.skip_folder_var.get()
@@ -2985,6 +3073,22 @@ class ImageOrganizationToolkit(QMainWindow):
         else:
             self.log_status(f"Moved {len(files_to_move)} files to '{folder_tag}'.", "success")
 
+    def open_image_externally(self, idx):
+        """Double-click: opens the picture in the computer's default image viewer. The first click of the double-click
+        has already marked (or unmarked) it as a range start / group pick; that's put back, so opening a picture
+        leaves nothing selected that wasn't before."""
+        if self.busy or not 0 <= idx < len(self.all_files):
+            return
+        undo, self._click_undo = self._click_undo, None
+        if undo is not None and undo[0] == idx:
+            undo[1]()
+        name = self.all_files[idx]
+        try:
+            open_with_system(os.path.join(self.image_folder, name))
+            self.log_status(f"Opened '{name}' in your default image viewer.", "info")
+        except Exception as err:   # no viewer set for this file type, file gone...
+            self.log_status(f"Couldn't open '{name}': {err}", "error")
+
     def _move_batch(self, files, target_dir, tag, should_rename, source_dir=None):
         """
         Two-phase move: everything goes to a temporary name first, then to its final name, so files
@@ -3047,10 +3151,10 @@ class ImageOrganizationToolkit(QMainWindow):
 
     def check_and_cleanup_cache(self):
         for cache in [self.disk_cache] + [cache for _, cache in self._retired_hubs]:
-            if self.keep_cache_var.get():
-                cache.trim()
-            else:
+            if self.cache_deletion_var.get():
                 cache.delete()
+            else:
+                cache.trim()
 
     def closeEvent(self, event):
         """The window's close button: clean up (recycle folder, folders marked with Q, and the cache unless

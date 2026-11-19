@@ -18,8 +18,8 @@ Usage
 Safe to stop at any time with Ctrl+C: everything finished so far is kept, and the next run carries
 on where it left off. Images that haven't changed are skipped in a fraction of a second.
 
-Note: tick "Disable Cache Deletion" in I.O.T (it's on by default), otherwise I.O.T deletes the
-cache when it closes.
+Note: untick "Cache Deletion" in I.O.T (it's ticked by default), otherwise I.O.T deletes the
+cache when it closes. (In the older Tkinter version: tick "Disable Cache Deletion".)
 """
 import os
 import sys
@@ -198,7 +198,7 @@ def precache(root, workers, clean_old):
             print(f"  {os.path.relpath(path, root)}  -  {error}")
         if len(failures) > 15:
             print(f"  ...and {len(failures) - 15} more")
-    print('\nReminder: keep "Disable Cache Deletion" ticked in I.O.T, or the cache is deleted when it closes.')
+    print('\nReminder: untick "Cache Deletion" in I.O.T, or the cache is deleted when it closes.')
     return 1 if failures else 0
 
 
