@@ -1,7 +1,7 @@
 # Builds a release whenever a version tag is pushed, e.g.:
 #   git tag v1.0.0
 #   git push origin v1.0.0
-# The release gets a zip of the program (ready to run with `python iot.py`) and notes listing the
+# The release gets a zip of the program (ready to run with `python iot.pyw`) and notes listing the
 # changes since the previous release.
 
 name: Release
@@ -27,13 +27,13 @@ jobs:
 
       - name: Check every file parses
         run: |
-          python -c "import ast, glob; [ast.parse(open(f, encoding='utf-8').read(), f) for f in ['iot.py'] + glob.glob('scripts/*.py')]"
+          python -c "import ast, glob; [ast.parse(open(f, encoding='utf-8').read(), f) for f in ['iot.pyw'] + glob.glob('scripts/*.py')]"
 
       - name: Package
         run: |
           name="IOT-${GITHUB_REF_NAME}"
           mkdir -p "dist/${name}"
-          cp -r iot.py scripts docs README.md LICENSE "dist/${name}/"
+          cp -r iot.pyw scripts docs README.md LICENSE "dist/${name}/"
           cd dist && zip -r -q "${name}.zip" "${name}"
 
       - name: Publish the release
