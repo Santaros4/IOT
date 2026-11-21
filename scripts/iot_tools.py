@@ -1,13 +1,14 @@
+"""The resizer's work (the dialogs that drive it are in iot_qt_dialogs.run_resizer)."""
 import os
-import threading
-from concurrent.futures import ThreadPoolExecutor
 from PIL import Image
 
 import iot_history
 import iot_utils
 
 # Save each file back in the format its extension says.
-_FORMAT_BY_EXTENSION = {'.jpg': 'JPEG', '.jpeg': 'JPEG', '.png': 'PNG', '.webp': 'WEBP', '.bmp': 'BMP'}
+_FORMAT_BY_EXTENSION = {'.jpg': 'JPEG', '.jpeg': 'JPEG', '.png': 'PNG', '.webp': 'WEBP', '.bmp': 'BMP', '.gif': 'GIF',
+                        '.avif': 'AVIF', '.heic': 'HEIF', '.heif': 'HEIF'}
+_QUALITY_FORMATS = ('JPEG', 'WEBP', 'AVIF', 'HEIF')   # formats the JPEG / WebP quality setting applies to
 
 
 def _compute_new_size(w, h, mode, target_bound):
@@ -40,10 +41,104 @@ def _estimate_resolution(folder, files, mode, target_bound, base_image=5):
     return f"{before}  →  {new_w} × {new_h} px"
 
 
+# EXIF orientation after turning a picture a quarter turn clockwise / anticlockwise (non-mirrored values only)
+_TURN_CLOCKWISE = {1: 6, 6: 3, 3: 8, 8: 1}
+_TURN_ANTICLOCKWISE = {value: key for key, value in _TURN_CLOCKWISE.items()}
+
+
+def _jpeg_with_orientation(data, value):
+    """The JPEG bytes with their EXIF orientation tag changed to `value`, nothing else touched (lossless), or None
+    when the file has no orientation tag to change."""
+    if data[:2] != b"\xff\xd8":
+        return None
+    pos = 2
+    while pos + 4 <= len(data) and data[pos] == 0xFF:
+        marker = data[pos + 1]
+        if marker in (0xD9, 0xDA):          # end of image / start of the picture data: no EXIF before it
+            return None
+        length = int.from_bytes(data[pos + 2:pos + 4], "big")
+        segment = pos + 4
+        if marker == 0xE1 and data[segment:segment + 6] == b"Exif\x00\x00":
+            tiff = segment + 6
+            order = "little" if data[tiff:tiff + 2] == b"II" else "big"
+            ifd = tiff + int.from_bytes(data[tiff + 4:tiff + 8], order)
+            count = int.from_bytes(data[ifd:ifd + 2], order)
+            for number in range(count):
+                entry = ifd + 2 + number * 12
+                if int.from_bytes(data[entry:entry + 2], order) == 0x0112:
+                    if int.from_bytes(data[entry + 2:entry + 4], order) != 3:   # not a SHORT: leave it alone
+                        return None
+                    out = bytearray(data)
+                    out[entry + 8:entry + 10] = value.to_bytes(2, order)
+                    return bytes(out)
+            return None
+        pos = segment + length - 2
+    return None
+
+
+def _rotate_one(img_path, clockwise, quality, stash_path):
+    """
+    Turns a picture a quarter turn. Returns (status, undo_steps, lossless): status 'rotated', 'animated' (left alone)
+    or 'failed'. JPEGs that carry an EXIF orientation tag just get the tag changed (no quality lost); anything else
+    is turned and saved again (PNG / BMP / GIF stay lossless, JPEG / WebP / AVIF / HEIC are re-saved at the quality
+    setting). The original goes to the session recycle folder, so Undo puts it back.
+    """
+    temp_path = img_path + ".iot_tmp"
+    try:
+        with Image.open(img_path) as img:
+            if getattr(img, "is_animated", False):
+                return 'animated', [], False
+            orientation = iot_utils._orientation(img)
+            ext = os.path.splitext(img_path)[1].lower()
+            save_format = _FORMAT_BY_EXTENSION.get(ext, img.format or 'JPEG')
+            turn = _TURN_CLOCKWISE if clockwise else _TURN_ANTICLOCKWISE
+            new_bytes = None
+            if save_format == 'JPEG' and orientation in turn:
+                with open(img_path, "rb") as handle:
+                    new_bytes = _jpeg_with_orientation(handle.read(), turn[orientation])
+            if new_bytes is None:
+                icc = img.info.get('icc_profile')
+                exif = img.getexif()
+                picture = iot_utils._upright(img.copy(), orientation)   # as it's shown, then a quarter turn
+                if picture.mode in ('P', 'PA') and save_format not in ('GIF', 'PNG'):
+                    picture = picture.convert('RGBA' if picture.mode == 'PA' or 'transparency' in img.info else 'RGB')
+                picture = picture.transpose(Image.Transpose.ROTATE_270 if clockwise else Image.Transpose.ROTATE_90)
+                if 0x0112 in exif:
+                    exif[0x0112] = 1        # the pixels are upright now
+                save_kwargs = {}
+                if save_format in _QUALITY_FORMATS:
+                    save_kwargs['quality'] = quality
+                if save_format == 'JPEG' and picture.mode not in ('RGB', 'L', 'CMYK'):
+                    picture = picture.convert('RGB')
+                if icc and save_format in ('JPEG', 'PNG', 'WEBP', 'AVIF', 'HEIF'):
+                    save_kwargs['icc_profile'] = icc
+                if len(exif) and save_format in ('JPEG', 'WEBP', 'PNG', 'AVIF', 'HEIF'):
+                    save_kwargs['exif'] = exif.tobytes()
+                picture.save(temp_path, format=save_format, **save_kwargs)
+        if new_bytes is not None:
+            with open(temp_path, "wb") as handle:
+                handle.write(new_bytes)
+        backup = stash_path(os.path.basename(img_path))
+        iot_history.move_file(img_path, backup)
+        try:
+            iot_history.retry_if_busy(os.replace, temp_path, img_path)
+        except OSError:
+            iot_history.move_file(backup, img_path)
+            raise
+        return 'rotated', [("move", img_path, backup), ("created", img_path)], new_bytes is not None
+    except Exception:
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            pass
+        return 'failed', [], False
+
+
 def _resize_one(img_path, mode, target_bound, quality, cancel_event, stash_path, strip_exif=False):
     """
-    Runs on a worker thread. Returns (status, undo_steps). status is 'converted', 'skipped',
-    'failed' or 'cancelled'. The original file is moved to the session recycle folder (not
+    Runs on a worker thread. Returns (status, undo_steps). status is 'converted', 'skipped', 'animated'
+    (left alone: saving would keep only the first frame), 'failed' or 'cancelled'. The original file is moved to the session recycle folder (not
     overwritten), so the resize can be undone until I.O.T closes.
     """
     if cancel_event.is_set():
@@ -51,6 +146,8 @@ def _resize_one(img_path, mode, target_bound, quality, cancel_event, stash_path,
     temp_path = img_path + ".iot_tmp"
     try:
         with Image.open(img_path) as img:
+            if getattr(img, "is_animated", False):
+                return 'animated', []
             new_size = _compute_new_size(img.size[0], img.size[1], mode, target_bound)
             if new_size is None:
                 return 'skipped', []
@@ -81,11 +178,11 @@ def _resize_one(img_path, mode, target_bound, quality, cancel_event, stash_path,
                 resized = resized.convert('RGB')
             save_kwargs['quality'] = quality
             save_kwargs['optimize'] = True  # smarter encoding: a few % smaller, identical picture
-        elif save_format == 'WEBP':
+        elif save_format in _QUALITY_FORMATS:
             save_kwargs['quality'] = quality
-        if icc and save_format in ('JPEG', 'PNG', 'WEBP'):
+        if icc and save_format in ('JPEG', 'PNG', 'WEBP', 'AVIF', 'HEIF'):
             save_kwargs['icc_profile'] = icc
-        if exif and save_format in ('JPEG', 'WEBP', 'PNG'):
+        if exif and save_format in ('JPEG', 'WEBP', 'PNG', 'AVIF', 'HEIF'):
             save_kwargs['exif'] = exif  # keeps camera orientation, so photos don't flip sideways
 
         resized.save(temp_path, format=save_format, **save_kwargs)
@@ -94,7 +191,7 @@ def _resize_one(img_path, mode, target_bound, quality, cancel_event, stash_path,
         backup = stash_path(os.path.basename(img_path))
         iot_history.move_file(img_path, backup)
         try:
-            os.replace(temp_path, img_path)
+            iot_history.retry_if_busy(os.replace, temp_path, img_path)
         except OSError:
             iot_history.move_file(backup, img_path)
             raise
@@ -106,173 +203,3 @@ def _resize_one(img_path, mode, target_bound, quality, cancel_event, stash_path,
         except OSError:
             pass
         return 'failed', []
-
-
-def run_image_resizer_thread(app_instance, mode="down", folders=None):
-    """
-    Batch resizer. mode='down' bounds down to target; mode='up' scales up to target.
-    folders: resize every image in these folders (e.g. a folder and all its sub-folders, from the folder
-    list); by default just the folder on screen. Images are resized in place and keep their names.
-    Work runs on background threads so the window stays responsive.
-    """
-    import tkinter as tk          # Tk version only (the Qt version has its own dialogs: iot_qt_dialogs)
-    from tkinter import ttk
-    import iot_theme
-    app = app_instance
-    t = app.theme
-    if getattr(app, 'busy', False):
-        return
-    if folders is None:
-        jobs = [(app.image_folder, list(app.all_files))]
-    else:
-        jobs = [(path, iot_utils.list_images(path, app.valid_extensions)) for path in folders]
-    jobs = [(path, names) for path, names in jobs if names]
-    if not jobs:
-        app.log_status("Resizer: no images to resize there.", 'warning')
-        return
-
-    title_word = "Downscale" if mode == "down" else "Upscale"
-    target_bound = app.down_target if mode == "down" else app.up_target
-    active_quality = app.jpg_quality  # same for both: quality 100 made upscales ~3x bigger for no visible gain
-    folder = folders[0] if folders else app.image_folder  # the top folder (named in the dialog and the undo list)
-    items = [(path, name) for path, names in jobs for name in names]  # (folder, file name) for every image
-    files = [os.path.join(path, name) for path, name in items]
-    top_name = os.path.basename(folder.rstrip("\\/")) or folder
-    if folders is not None and len(folders) > 1:
-        sub_count = len(folders) - 1
-        where = f"'{top_name}' and its {sub_count} sub-folder{'s' if sub_count != 1 else ''}"
-    else:
-        where = f"'{top_name}'"
-    image_word = "image" if len(files) == 1 else "images"
-    in_folders = f" in {len(jobs)} folders" if len(jobs) > 1 else ""
-
-    # ---- Confirmation ----
-    confirmed = [False]
-    confirm_window = iot_theme.make_dialog(app, f"{title_word} images")
-    iot_theme.dialog_header(confirm_window, t, f"{title_word} {len(files)} {image_word}{in_folders}?",
-                            f"Images in {where} will be resized in place, names unchanged, so their short edge is "
-                            f"{target_bound} px{' (only ones larger than that)' if mode == 'down' else ' (only ones smaller than that)'}.")
-    details = t.paint(tk.Frame(confirm_window, bd=0, highlightthickness=1), bg="surface_alt", highlightbackground="border")
-    details.pack(fill=tk.X, padx=22, pady=(8, 0))
-    base_image = getattr(app, "base_image", 5)
-    sample_folder, sample_files = jobs[0]
-    estimate = _estimate_resolution(sample_folder, sample_files, mode, target_bound, base_image)
-    sample_name = f"{iot_utils.ordinal(base_image)} image" if len(sample_files) >= base_image else "Last image"
-    if len(jobs) > 1:
-        sample_name += f" of '{os.path.basename(sample_folder.rstrip(chr(92) + '/'))}'"
-    rows = ([("Altered resolution", estimate), ("", f"Estimate from the {sample_name[0].lower() + sample_name[1:]}")]
-            if estimate else [])
-    for label, value in rows + [("Short edge", f"{target_bound} px"), ("JPEG / WebP quality", f"{active_quality}%"),
-                         ("EXIF data", "Removed" if getattr(app, "strip_exif", False) else "Kept"),
-                         ("Undo", "Originals are kept until I.O.T closes")]:
-        row = t.paint(tk.Frame(details, bd=0), bg="surface_alt")
-        row.pack(fill=tk.X, padx=12, pady=3)
-        t.paint(tk.Label(row, text=label, font=t.f["small"], bd=0, width=20, anchor="w"), bg="surface_alt", fg="text_muted").pack(side=tk.LEFT)
-        note = label == ""  # the small "estimate from…" line under Altered resolution
-        t.paint(tk.Label(row, text=value, font=t.f["caption"] if note else t.f["small"], bd=0, anchor="w"),
-                bg="surface_alt", fg="text_faint" if note else "text").pack(side=tk.LEFT)
-
-    def handle_confirm_click(event=None):
-        confirmed[0] = True
-        confirm_window.destroy()
-
-    iot_theme.dialog_buttons(confirm_window, t, [(title_word, handle_confirm_click, "primary"),
-                                                 ("Cancel", confirm_window.destroy, "secondary")])
-    confirm_window.bind("<Return>", handle_confirm_click)
-    confirm_window.bind("<Escape>", lambda e: confirm_window.destroy())
-    iot_theme.show_dialog(app, confirm_window, min_width=460)
-
-    app.root.wait_window(confirm_window)
-    if not confirmed[0]:
-        return
-
-    # ---- Progress window ----
-    app.busy = True
-    res_box = iot_theme.make_dialog(app, f"{title_word} in progress")
-    iot_theme.dialog_header(res_box, t, f"{title_word.rstrip('e')}ing images…")
-    body = t.paint(tk.Frame(res_box, bd=0), bg="surface")
-    body.pack(fill=tk.X, padx=22, pady=(6, 0))
-    status_label = t.paint(tk.Label(body, text=f"0 of {len(files)}", font=t.f["small"], bd=0, anchor="w"), bg="surface", fg="text_muted")
-    status_label.pack(fill=tk.X, pady=(0, 6))
-    p_bar = ttk.Progressbar(body, orient=tk.HORIZONTAL, mode='determinate', maximum=len(files), style="IOT.Horizontal.TProgressbar")
-    p_bar.pack(fill=tk.X)
-
-    cancel_event = threading.Event()
-    futures = []
-
-    def request_cancel():
-        cancel_event.set()
-        for future in futures:
-            future.cancel()
-        status_label.config(text="Cancelling… finishing the images already in progress")
-
-    iot_theme.dialog_buttons(res_box, t, [("Cancel", request_cancel, "secondary")])
-    res_box.protocol("WM_DELETE_WINDOW", request_cancel)
-    iot_theme.show_dialog(app, res_box, min_width=460)
-
-    # PIL releases the GIL while decoding/resizing/encoding, so threads give real parallelism here
-    worker_count = max(2, min(8, os.cpu_count() or 4))
-    executor = ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="iot-resize")
-    strip_exif = getattr(app, "strip_exif", False)
-    futures.extend(executor.submit(_resize_one, path, mode, target_bound, active_quality,
-                                   cancel_event, app.session.stash_path, strip_exif) for path in files)
-    executor.shutdown(wait=False)
-
-    def poll_progress():
-        done_count = sum(1 for future in futures if future.done())
-        p_bar['value'] = done_count
-        if not cancel_event.is_set():
-            status_label.config(text=f"{done_count} of {len(files)}")
-        if done_count < len(files):
-            res_box.after(100, poll_progress)
-            return
-        finish()
-
-    def finish():
-        tally = {'converted': 0, 'skipped': 0, 'failed': 0, 'cancelled': 0}
-        steps, changed, changed_folders = [], [], []
-        for (path, name), future in zip(items, futures):
-            if future.cancelled():
-                tally['cancelled'] += 1
-                continue
-            status, file_steps = future.result()
-            tally[status] += 1
-            if file_steps:
-                steps.extend(file_steps)
-                changed.append(name)
-                if path not in changed_folders:
-                    changed_folders.append(path)
-        try:
-            res_box.grab_release()
-            res_box.destroy()
-        except tk.TclError:
-            pass
-        app.busy = False
-
-        if tally['converted']:
-            scope = f" in '{top_name}' and its sub-folders" if len(changed_folders) > 1 else ""
-            app._record("Resize", f"{title_word}d {tally['converted']} images to {target_bound} px{scope}", folder, steps,
-                        [iot_history.describe_range(changed, "image") + f"  ->  {target_bound} px short edge"]
-                        + ([f"in {len(changed_folders)} folders"] if len(changed_folders) > 1 else [])
-                        + ([f"{tally['skipped']} already within bounds, left unchanged"] if tally['skipped'] else []))
-            for changed_folder in changed_folders:
-                app.modified_folders.add(changed_folder)
-                app.invalidate_folder_thumbnails(changed_folder)
-            app.refresh_folders(changed_folders)
-            if app.image_folder in changed_folders:
-                app.load_directory_target_sequence(app.image_folder)
-            else:
-                app.refresh_folder_button()
-
-        message = f"{title_word}: {tally['converted']} images resized"
-        if tally['skipped']:
-            message += f", {tally['skipped']} already within bounds"
-        if tally['cancelled']:
-            message += f", {tally['cancelled']} cancelled"
-        if tally['failed']:
-            message += f", {tally['failed']} failed (unreadable or locked)"
-            app.log_status(message + ".", 'error')
-        else:
-            app.log_status(message + ".", 'success')
-
-    res_box.after(100, poll_progress)

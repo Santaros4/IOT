@@ -31,15 +31,33 @@ def hide_path(path):
             pass
 
 
+def _in_use(err):
+    """True for Windows' "the file is being used by another process" (also another thread of I.O.T: the thumbnail
+    loader opens a picture for a moment to draw it, and Windows won't rename or delete a file while it's open)."""
+    return isinstance(err, PermissionError) and getattr(err, "winerror", None) in (32, 33)
+
+
+def retry_if_busy(action, *args, seconds=2.0):
+    """Runs action(*args), trying again for a moment while Windows says the file is in use."""
+    deadline = time.monotonic() + seconds
+    while True:
+        try:
+            return action(*args)
+        except OSError as err:
+            if not _in_use(err) or time.monotonic() > deadline:
+                raise
+            time.sleep(0.05)
+
+
 def move_file(src, dst):
     """Moves a file without ever overwriting. Same drive = instant rename; other drive = copy."""
     if os.path.lexists(dst):
         raise FileExistsError(f"'{os.path.basename(dst)}' already exists")
     try:
-        os.rename(src, dst)
+        retry_if_busy(os.rename, src, dst)
     except OSError:
         if os.path.exists(src) and not os.path.lexists(dst):
-            shutil.move(src, dst)
+            retry_if_busy(shutil.move, src, dst)
         else:
             raise
 
@@ -228,7 +246,7 @@ class History:
                 path = step[1]
                 try:
                     if os.path.exists(path):
-                        os.remove(path)
+                        retry_if_busy(os.remove, path)
                     touched.add(os.path.dirname(path))
                 except OSError as err:
                     problems.append(f"{os.path.basename(path)}: {err}")
@@ -240,7 +258,7 @@ class History:
                     problems.append(f"A folder named '{os.path.basename(src)}' already exists")
                 else:
                     try:
-                        os.rename(dst, src)
+                        retry_if_busy(os.rename, dst, src)
                         restored += 1
                         touched.update({os.path.dirname(src), src})
                         self.rewrite_paths(dst, src, skip=record)

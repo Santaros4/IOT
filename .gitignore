@@ -19,3 +19,6 @@ __pycache__/
 *.iot_tmp
 .iot_stage_*
 .iot_undo_*
+
+# The test suite stays on the developer's computer (and out of releases)
+scripts/tests/

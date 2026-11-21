@@ -7,7 +7,7 @@ is picked up by the app.
 
 Usage
   Run it from the same folder you open in I.O.T (the parent hub), or pass that folder:
-      python scripts\\iot_precache.py "D:\\Pictures\\Hub"      (from the folder iot.py is in)
+      python scripts\\iot_precache.py "D:\\Pictures\\Hub"      (from the folder iot.pyw is in)
   Options
       --workers N      number of images processed at once (default: one per CPU core, max 8)
       --clean-old      delete thumbnails left by the old version of this script without asking
@@ -19,7 +19,7 @@ Safe to stop at any time with Ctrl+C: everything finished so far is kept, and th
 on where it left off. Images that haven't changed are skipped in a fraction of a second.
 
 Note: untick "Cache Deletion" in I.O.T (it's ticked by default), otherwise I.O.T deletes the
-cache when it closes. (In the older Tkinter version: tick "Disable Cache Deletion".)
+cache when it closes.
 """
 import os
 import sys

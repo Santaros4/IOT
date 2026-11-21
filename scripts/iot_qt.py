@@ -6,9 +6,10 @@ Palettes, the style sheet and most widgets are V.O.T's, extended with what I.O.T
 the folder list, tag colours, key-caps, the zoom slider).
 """
 import sys
+import time
 
 from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import (QColor, QConicalGradient, QFont, QFontDatabase, QFontMetrics, QGuiApplication, QImage,
+from PySide6.QtGui import (QColor, QConicalGradient, QRadialGradient, QFont, QFontDatabase, QFontMetrics, QGuiApplication, QImage,
                            QLinearGradient, QPainter, QPainterPath, QPen, QPixmap)
 from PySide6.QtWidgets import (QApplication, QDialog, QFrame, QGraphicsDropShadowEffect, QGridLayout, QHBoxLayout,
                                QLabel, QLayout, QPushButton, QSizePolicy, QVBoxLayout, QWidget)
@@ -118,6 +119,10 @@ QLabel#tilename[state="dup"] {{ color: {p['danger']}; font-weight: 700; }}
 QFrame#duptile {{ background: {p['row_bg']}; border: 1px solid {p['row_border']}; border-radius: 18px; }}
 QFrame#duptile:hover {{ border: 2px solid {p['accent']}; }}
 QFrame#duptile QLabel {{ background: transparent; border: none; }}
+QListWidget {{ background: {p['input_bg']}; border: 1px solid {p['input_border']}; border-radius: 12px; padding: 6px; outline: none; }}
+QListWidget::item {{ padding: 6px 8px; border-radius: 7px; }}
+QListWidget::item:hover {{ background: {p['btn_hover']}; }}
+QListWidget::item:selected {{ background: {p['accent_strong']}; color: #ffffff; }}
 QFrame#popup {{ background: {p['menu_bg']}; border: 1px solid {p['menu_border']}; border-radius: 12px; }}
 QFrame#treerow {{ background: transparent; border: none; border-radius: 8px; }}
 QFrame#treerow:hover {{ background: {p['btn_hover']}; }}
@@ -149,6 +154,9 @@ QPushButton#static {{ padding: 6px 14px; border-radius: 10px; background: transp
 QPushButton#static:hover {{ background: transparent; }}
 QPushButton#ghost {{ background: transparent; border: none; padding: 6px 10px; }}
 QPushButton#ghost:hover {{ background: {p['btn_hover']}; }}
+QPushButton#browse {{ background: {p['input_bg']}; border: 1px solid {p['input_border']}; border-radius: 12px; padding: 0; }}
+QPushButton#browse:hover {{ border: 1px solid {p['accent']}; }}
+QPushButton#browse:pressed {{ background: {p['btn_pressed']}; }}
 QPushButton#tab {{ padding: 0; border-radius: 9px; font-size: 14pt; font-weight: 800; color: {p['muted']}; }}
 QPushButton#tab:hover {{ color: {p['text']}; border: 1px solid {p['accent']}; }}
 QFrame#folderbar {{ background: {p['input_bg']}; border: 1px solid {p['input_border']}; border-radius: 12px; }}
@@ -202,7 +210,7 @@ def later(callback, ms=0):
 
 
 class Var:
-    """A tiny stand-in for tkinter's BooleanVar / StringVar: a value plus watchers (trace_add)."""
+    """A value plus watchers (trace_add), like tkinter's BooleanVar / StringVar: options and checkboxes share it."""
 
     def __init__(self, value=False):
         self._value = value
@@ -332,6 +340,28 @@ def pil_to_pixmap(image):
     return QPixmap.fromImage(qimage.copy())
 
 
+def flag_html(text):
+    """Folder flags as rich text: the resize arrows (🡇 / 🡅) in the palette's amber, the rest as they are. Labels
+    showing it need Qt.RichText (flag_label sets that)."""
+    import html
+    import iot_platform
+    style = f"color:{P['warning']};font-weight:800;"
+    if iot_platform.FLAG_ARROW_FONT:
+        style += f"font-family:'{iot_platform.FLAG_ARROW_FONT}';"
+    out = html.escape(text).replace("  ", "&nbsp; ")   # rich text would merge double spaces
+    for arrow in (iot_platform.FLAG_DOWN, iot_platform.FLAG_UP):
+        out = out.replace(arrow, f'<span style="{style}">{arrow}</span>')
+    return f"<span>{out}</span>"
+
+
+def flag_label(text="", kind=""):
+    """A label for text that may hold folder flags (the arrows are coloured)."""
+    widget = label("", kind)
+    widget.setTextFormat(Qt.TextFormat.RichText)
+    widget.setText(flag_html(text))
+    return widget
+
+
 def dot_pixmap(colour, size=12, outline=False):
     """A tag dot (or the outlined 'no tag' circle)."""
     ratio = 2
@@ -455,6 +485,63 @@ class WindowRoot(QWidget):
         self.drag_limit = 110          # dragging allowed above this y (the header)
         self.controls = None
         self.setMouseTracking(True)
+        self.ripples = []              # (x, y, started): rings spreading on the background (the Easter egg)
+        self._ripple_area = QRect()
+        self._ripple_timer = QTimer(self, interval=16)
+        self._ripple_timer.timeout.connect(self._ripple_tick)
+
+    RIPPLE_RADIUS, RIPPLE_LIFE = 95, 1.15   # px, seconds
+
+    def add_ripple(self, point):
+        self.ripples.append((point.x(), point.y(), time.monotonic()))
+        del self.ripples[:-40]
+        if not self._ripple_timer.isActive():
+            self._ripple_timer.start()
+
+    def _ripple_rect(self, x, y):
+        r = self.RIPPLE_RADIUS + 4
+        return QRect(int(x - r), int(y - r), 2 * r, 2 * r)
+
+    def _ripple_tick(self):
+        now = time.monotonic()
+        self.ripples = [ripple for ripple in self.ripples if now - ripple[2] < self.RIPPLE_LIFE]
+        area = QRect()
+        for x, y, _ in self.ripples:
+            area = area.united(self._ripple_rect(x, y))
+        self.update(area.united(self._ripple_area))   # only where rings are (or just were): cheap
+        self._ripple_area = area
+        if not self.ripples:
+            self._ripple_timer.stop()
+
+    def _paint_ripples(self, painter):
+        if not self.ripples:
+            return
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        light = not P["text"].startswith("#e")
+        base = QColor(47, 107, 255) if light else QColor(175, 205, 255)
+        now = time.monotonic()
+        for x, y, started in self.ripples:
+            t = min(1.0, (now - started) / self.RIPPLE_LIFE)
+            ease = 1 - (1 - t) ** 3                       # fast at first, then slowing, like a real ripple
+            radius = self.RIPPLE_RADIUS * (0.12 + 0.88 * ease)
+            fade = (1 - t) ** 1.6
+            glow = QRadialGradient(QPointF(x, y), radius)   # a faint sheen inside the ring
+            inner = QColor(base)
+            inner.setAlpha(0)
+            edge = QColor(base)
+            edge.setAlpha(int(34 * fade))
+            glow.setColorAt(0.0, inner)
+            glow.setColorAt(0.82, inner)
+            glow.setColorAt(1.0, edge)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(glow)
+            painter.drawEllipse(QPointF(x, y), radius, radius)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            for scale, strength, width in ((1.0, 120, 1.8), (0.66, 70, 1.3), (0.38, 40, 1.0)):
+                ring = QColor(base)
+                ring.setAlpha(int(strength * fade))
+                painter.setPen(QPen(ring, width))
+                painter.drawEllipse(QPointF(x, y), radius * scale, radius * scale)
 
     def _edges(self, pos):
         if not FRAMELESS or self.win.isMaximized() or self.win.isFullScreen():
@@ -502,11 +589,14 @@ class WindowRoot(QWidget):
 
     def paintEvent(self, event):
         paint_gradient(self)
+        painter = QPainter(self)
+        self._paint_ripples(painter)
         if FRAMELESS and not self.win.isMaximized():
-            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
             painter.setPen(QPen(QColor(*P["edge"]), 1))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
-            painter.end()
+        painter.end()
 
 
 class GradientDialog(QDialog):
@@ -849,6 +939,7 @@ class FolderBar(QFrame):
         self.name_label = QLabel("")
         self.name_label.setStyleSheet("font-weight: 800;")
         self.flags_label = QLabel("")
+        self.flags_label.setTextFormat(Qt.TextFormat.RichText)
         self.count_label = ElidedLabel("", mode=Qt.TextElideMode.ElideLeft)
         self.count_label.setObjectName("faint")
         self.count_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -874,7 +965,7 @@ class FolderBar(QFrame):
         font = self.name_label.font()
         font.setStrikeOut(bool(struck))
         self.name_label.setFont(font)
-        self.flags_label.setText(flags)
+        self.flags_label.setText(flag_html(flags))   # the resize arrows in amber
         self.count_label.setFullText(count_text)
         if tag_colour:
             self.dot.setPixmap(dot_pixmap(tag_colour, 12))

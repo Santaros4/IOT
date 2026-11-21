@@ -7,8 +7,27 @@ import hashlib
 import threading
 from PIL import Image, PngImagePlugin
 
-# Single source of truth for which files count as images across every module
-IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.webp', '.bmp')
+# HEIC / HEIF (iPhone photos) need the optional pillow-heif package; without it they're simply not listed
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+    HEIF_SUPPORT = True
+except Exception:
+    HEIF_SUPPORT = False
+
+
+def _pillow_reads_avif():
+    try:
+        from PIL import features
+        return bool(features.check("avif"))   # built into Pillow 11.3+
+    except Exception:
+        return False
+
+
+# Single source of truth for which files count as images across every module. GIFs show their first frame.
+IMAGE_EXTENSIONS = (('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif')
+                    + (('.avif',) if _pillow_reads_avif() else ())
+                    + (('.heic', '.heif') if HEIF_SUPPORT else ()))
 
 _DIGIT_SPLIT = re.compile(r'([0-9]+)')
 
@@ -122,7 +141,7 @@ def read_display_size(image_path):
 
 
 def _to_displayable(img):
-    """Tk can only show a handful of modes; convert anything else."""
+    """Converts unusual image modes to RGB / RGBA (what the thumbnails and previews are shown in)."""
     if img.mode in ('RGB', 'RGBA', 'L'):
         return img
     if img.mode in ('LA', 'PA') or (img.mode == 'P' and 'transparency' in img.info):
@@ -149,6 +168,37 @@ def load_thumbnail(image_path, size):
         img.thumbnail((size, size), Image.Resampling.LANCZOS, reducing_gap=2.0)
         # Rotating the small thumbnail is far cheaper than rotating the full image first
         return _upright(_to_displayable(img), orientation), original_size
+
+
+_EXIF_IFD = 0x8769
+
+
+def read_photo_info(image_path):
+    """(date taken as 'YYYY:MM:DD HH:MM:SS', camera as 'Make Model') from the picture's EXIF, header only. Either is
+    None when the picture doesn't say. Safe to call from a worker thread."""
+    try:
+        with Image.open(image_path) as img:
+            exif = img.getexif()
+            taken = exif.get_ifd(_EXIF_IFD).get(36867) or exif.get(306)   # DateTimeOriginal, else DateTime
+            make, model = exif.get(271), exif.get(272)
+    except Exception:
+        return None, None
+
+    def clean(value):
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", "ignore")
+        value = str(value).strip().strip("\x00").strip() if value is not None else ""
+        return value or None
+    taken, make, model = clean(taken), clean(make), clean(model)
+    if taken and not re.match(r"\d{4}:\d{2}:\d{2}", taken):
+        taken = None   # junk such as "0000:00:00 00:00:00" is treated as missing
+    if taken and taken.startswith("0000"):
+        taken = None
+    if make and model and model.lower().startswith(make.split()[0].lower()):
+        camera = model           # "Canon EOS R5" rather than "Canon Canon EOS R5"
+    else:
+        camera = " ".join(part for part in (make, model) if part) or None
+    return taken, camera
 
 
 def ordinal(n):

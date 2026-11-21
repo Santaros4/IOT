@@ -9,7 +9,6 @@ Python packages:  pip install PySide6 pillow
 Start folder: a folder passed on the command line, else the folder it was launched from (OneCommander),
 else this script's folder. Drop a folder onto the window to open it.
 
-The older Tkinter version (needs only Pillow) is kept as scripts/iot_tk.py.
 """
 import os
 import re
@@ -26,6 +25,28 @@ import subprocess
 from collections import OrderedDict
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
+
+# --- .pyw support: with no console, stdout/stderr/stdin are None, so print() goes nowhere and input()
+# crashes. Keep printed text, and make input() (used as "Press Enter to close") show it in a message box.
+if sys.stdout is None or sys.stderr is None:
+    import io as _io
+    import builtins as _builtins
+    _console = _io.StringIO()
+    if sys.stdout is None:
+        sys.stdout = _console
+    if sys.stderr is None:
+        sys.stderr = _console
+
+    def _gui_input(prompt=""):
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                ctypes.windll.user32.MessageBoxW(None, (_console.getvalue().strip() or "Stopped.")[-3000:],
+                                                 "I.O.T", 0x10)
+            except Exception:
+                pass
+        return ""
+    _builtins.input = _gui_input
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # Our own modules live in the 'scripts' folder next to this file (keeps this folder down to a few items)
@@ -47,8 +68,7 @@ def _require(module, pip_name):
         return __import__(module)
     except ImportError as err:
         text = (f"I.O.T needs the '{pip_name}' package, which isn't installed for this Python:\n{sys.executable}\n\n"
-                f"Install it with:\n    \"{sys.executable}\" -m pip install {pip_name}\n\n({err})\n\n"
-                "(The older Tkinter version needs only Pillow:  python scripts/iot_tk.py)")
+                f"Install it with:\n    \"{sys.executable}\" -m pip install {pip_name}\n\n({err})")
         print(text, file=sys.stderr)
         if sys.platform.startswith("win"):
             try:
@@ -63,11 +83,12 @@ def _require(module, pip_name):
 _require("PySide6", "PySide6")
 _require("PIL", "pillow")
 
-from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, Qt, QTimer  # noqa: E402
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, QSize, Qt, QTimer  # noqa: E402
 from PySide6.QtGui import (QColor, QCursor, QFont, QFontMetrics, QGuiApplication, QKeySequence,  # noqa: E402
                            QPainter, QPainterPath, QPen, QPixmap)
-from PySide6.QtWidgets import (QApplication, QCheckBox, QFrame, QHBoxLayout, QLabel, QMainWindow,  # noqa: E402
-                               QMenu, QScrollArea, QScrollBar, QSlider, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QCheckBox, QFileDialog, QFrame, QHBoxLayout, QLabel,  # noqa: E402
+                               QLineEdit, QMainWindow, QMenu, QScrollArea, QScrollBar, QSizePolicy, QSlider, QVBoxLayout,
+                               QWidget)
 
 import iot_utils  # noqa: E402
 import iot_dialogs  # noqa: E402  (the SHORTCUTS / FLAGS / CONFIRMATIONS tables)
@@ -75,9 +96,15 @@ import iot_history  # noqa: E402
 import iot_platform  # noqa: E402
 import iot_qt  # noqa: E402
 import iot_qt_dialogs as dialogs  # noqa: E402
+import iot_tools  # noqa: E402
 from iot_qt import (P, FRAMELESS, FlowLayout, FolderBar, GroupButton, Var, WindowControls, WindowRoot,  # noqa: E402
-                    MessageDialog, bind_check, button, card, caps, dot_pixmap, label, later, pil_to_pixmap,
-                    set_palette, set_round_corners, transparent_box)
+                    MessageDialog, bind_check, button, card, caps, dot_pixmap, flag_label, folder_icon, label, later,
+                    pil_to_pixmap, set_palette, set_round_corners, transparent_box)
+
+try:   # optional: Settings > "send deleted files to the Recycle Bin"
+    from send2trash import send2trash
+except ImportError:
+    send2trash = None
 
 iot_history.hide_path(os.path.join(SCRIPTS_DIR, "__pycache__"))  # Python's compiled cache: hidden, still used
 
@@ -137,7 +164,12 @@ TAG_COLORS = ("red", "orange", "yellow", "green", "blue", "purple", "grey")  # f
 TAGS_FILE_NAME = ".iot_tags.json"   # hidden file in the hub: {"tags": {"relative/folder": "green"}}
 HEAL_INTERVAL_MS = 3000         # how often on-screen tiles still waiting for their picture are asked for again
 UNDO_KEYS = iot_platform.keys("Ctrl+Z")   # Cmd+Z on macOS
-FLAG_TARGET, FLAG_SIZE, FLAG_MODIFIED = iot_platform.FLAG_TARGET, iot_platform.FLAG_SIZE, iot_platform.FLAG_MODIFIED
+# old settings still read once (load_settings), then dropped. target_resolution: the resize flags now compare with
+# the Downscale / Upscale sizes (2026-11-20)
+RETIRED_SETTINGS = {"disable_cache_deletion", "base_image", "target_resolution"}
+SORT_MODES = (("name", "Name"), ("taken", "Date taken"), ("modified", "Date modified"), ("size", "Size (largest first)"))
+FLAG_DOWN, FLAG_UP = iot_platform.FLAG_DOWN, iot_platform.FLAG_UP
+FLAG_SIZE, FLAG_MODIFIED = iot_platform.FLAG_SIZE, iot_platform.FLAG_MODIFIED
 
 
 def folder_name_problem(name):
@@ -472,7 +504,8 @@ class ThumbGrid(QWidget):
                 mods = event.modifiers()
                 # Ctrl / Alt here are Cmd / Option on macOS (where Ctrl+Click means right-click)
                 mode = ("ctrl" if mods & Qt.KeyboardModifier.ControlModifier else
-                        "alt" if mods & Qt.KeyboardModifier.AltModifier else "click")
+                        "alt" if mods & Qt.KeyboardModifier.AltModifier else
+                        self.app._held_key or "click")   # C / R held: 'compress' / 'rename'
                 self.app.handle_image_click(idx, mode)
             event.accept()
             return
@@ -499,6 +532,34 @@ class ThumbGrid(QWidget):
         event.accept()
 
 
+class _TitleLabel(QLabel):
+    """The "I.O.T" title. A click inside the hole of its O switches the ripples on and off (an Easter egg); anywhere
+    else the click goes on to the window (dragging it, as before)."""
+
+    def __init__(self, app):
+        super().__init__(APP_NAME)
+        self.app = app
+        self.setObjectName("title")
+
+    def in_the_o(self, pos):
+        metrics = QFontMetrics(self.font())
+        rect = self.contentsRect()
+        left = rect.left() + metrics.horizontalAdvance(APP_NAME[:APP_NAME.index("O")])
+        width = metrics.horizontalAdvance("O")
+        baseline = rect.top() + (rect.height() + metrics.ascent() - metrics.descent()) / 2
+        cap = metrics.capHeight()
+        dx = pos.x() - (left + width / 2)
+        dy = pos.y() - (baseline - cap / 2)
+        return abs(dx) < width * 0.26 and abs(dy) < cap * 0.28
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self.in_the_o(event.position()):
+            self.app.toggle_ripples()
+            event.accept()
+            return
+        event.ignore()
+
+
 class HoverTip(QFrame):
     """The picture's name and size next to the pointer. Never takes focus or the mouse."""
 
@@ -522,9 +583,10 @@ class HoverTip(QFrame):
         lines.addWidget(self.name)
         lines.addWidget(self.size)
 
-    def show_at(self, name, dims, global_pos):
+    def show_at(self, name, details, global_pos):
+        """details: the lines under the name (pixel size, and file size / date taken / camera if chosen)."""
         self.name.setText(name)
-        self.size.setText(f"{dims[0]} × {dims[1]} px" if dims else "Size unknown")
+        self.size.setText("\n".join(details))
         self.adjustSize()
         screen = QGuiApplication.screenAt(global_pos) or QGuiApplication.primaryScreen()
         right = screen.geometry().right()
@@ -537,22 +599,31 @@ class HoverTip(QFrame):
 
 
 class ZoomPreview(QWidget):
-    """Hover + Hold Z: the picture as large as the screen allows, over a frosted copy of the screen. It never
-    takes the keyboard, so letting go of Z still reaches the main window."""
+    """Hover + Z: the picture as large as the screen allows, over a frosted copy of the screen. It never takes the
+    keyboard (Z, Esc and the arrow keys still reach the main window); a click on it closes it."""
 
-    def __init__(self, screen, pixmap, frost):
+    def __init__(self, screen, pixmap, frost, on_click=None):
         super().__init__(None, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint |
-                         Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.WindowDoesNotAcceptFocus |
-                         Qt.WindowType.WindowTransparentForInput)   # the pointer stays "over" its picture
+                         Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.WindowDoesNotAcceptFocus)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
-        self.pixmap, self.frost = pixmap, frost
-        area = screen.geometry()
+        self.screen_area, self.frost, self.on_click = screen.geometry(), frost, on_click
+        self.set_pixmap(pixmap)
+
+    def set_pixmap(self, pixmap):
+        self.pixmap = pixmap
+        area = self.screen_area
         ratio = pixmap.devicePixelRatio()
         w, h = int(pixmap.width() / ratio), int(pixmap.height() / ratio)
-        if frost is not None:
+        if self.frost is not None:
             self.setGeometry(area)
         else:   # no frost: only the picture covers the screen
             self.setGeometry(area.x() + (area.width() - w) // 2, area.y() + max(0, (area.height() - h) // 2), w, h)
+        self.update()
+
+    def mousePressEvent(self, event):
+        if self.on_click:
+            self.on_click()
+        event.accept()
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -667,6 +738,27 @@ class _TreeRow(QFrame):
         event.accept()
 
 
+class _SearchBox(QLineEdit):
+    """The folder list's search box: Esc clears it (and closes the list when it's already empty)."""
+
+    def __init__(self, popup):
+        super().__init__()
+        self.popup = popup
+        self.setPlaceholderText("Type to search folders")
+        self.setClearButtonEnabled(True)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            if self.text():
+                self.clear()
+                self.popup.setFocus()   # the hover keys work again
+            else:
+                self.popup.close()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
 class FolderListPopup(QWidget):
     """
     The folder list under the folder box: the whole hub as a tree with counts, sizes, flags and tags.
@@ -693,6 +785,16 @@ class FolderListPopup(QWidget):
         outer.addWidget(frame)
         inner = QVBoxLayout(frame)
         inner.setContentsMargins(6, 6, 2, 6)
+        inner.setSpacing(6)
+        # Typing filters the list (folders whose name contains it, with the folders above them for context)
+        self.search = _SearchBox(self)
+        self.search.textChanged.connect(lambda _text: self.rebuild(scroll_to_top=True))
+        self.search.returnPressed.connect(self._open_first_match)
+        self._first_match = None
+        search_row = QHBoxLayout()
+        search_row.setContentsMargins(6, 2, 10, 0)
+        search_row.addWidget(self.search)
+        inner.addLayout(search_row)
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -706,7 +808,7 @@ class FolderListPopup(QWidget):
         self.rebuild()
 
     # --- building ---
-    def rebuild(self):
+    def rebuild(self, scroll_to_top=False):
         app = self.app
         registry = app.virtual_folder_path_expansion_registry
         infos = app.folder_info_list
@@ -741,17 +843,32 @@ class FolderListPopup(QWidget):
         rows.setContentsMargins(0, 0, 8, 0)
         rows.setSpacing(self.ROW_SPACING)
         self.active_row = None
+        query = self.search.text().strip().lower()
+        matches, shown = set(), set()
+        if query:   # the matching folders and every folder above them, all open
+            ancestors = []
+            for i, item in enumerate(infos):
+                del ancestors[item["depth"]:]
+                if query in item["name"].lower():
+                    matches.add(i)
+                    shown.update(ancestors)
+                    shown.add(i)
+                ancestors.append(i)
+        self._first_match = next((infos[i]["path"] for i in sorted(matches)), None)
         hide_below = None
         row_count = 0
         for index, info in enumerate(infos):
             depth = info["depth"]
-            if hide_below is not None:
+            if query:
+                if index not in shown:
+                    continue
+            elif hide_below is not None:
                 if depth > hide_below:
                     continue
                 hide_below = None
             norm = norms[index]
             has_children = branch_end[index] > index + 1
-            expanded = registry.setdefault(norm, depth == 0)
+            expanded = True if query else registry.setdefault(norm, depth == 0)
             if has_children and not expanded:
                 hide_below = depth
             is_active = norm == active
@@ -780,13 +897,15 @@ class FolderListPopup(QWidget):
             name.setObjectName("treename")
             name.setProperty("active", "true" if is_active else "false")
             name.setProperty("pending", "true" if pending else "false")
-            if pending or is_active:
+            if pending or is_active or index in matches:
                 font = QFont(name.font())
                 font.setStrikeOut(pending)   # Q: crossed out until I.O.T closes
-                font.setBold(is_active)
+                font.setBold(is_active or index in matches)
                 name.setFont(font)
+            if query and index not in matches:
+                name.setStyleSheet(f"color: {P['faint']};")   # only shown for context
             line.addWidget(name)
-            if has_children and expanded:   # + (open everything below) / − (close everything below)
+            if has_children and expanded and not query:   # + (open everything below) / − (close everything below)
                 if closed_before[branch_end[index]] > closed_before[index + 1]:
                     line.addWidget(self._branch_button(True, index, norms))
                 if open_before[branch_end[index]] > open_before[index + 1]:
@@ -794,7 +913,7 @@ class FolderListPopup(QWidget):
             line.addSpacing(4)
             flags = app._folder_flags(info).strip()
             if flags:
-                line.addWidget(QLabel(flags))
+                line.addWidget(flag_label(flags))
             line.addStretch(1)
             own, total = info["image_count"], info["total_image_count"]
             if total > own:   # sub-folders hold images too: the sum for the whole branch
@@ -820,8 +939,13 @@ class FolderListPopup(QWidget):
             row_count += 1
             if is_active:
                 self.active_row = row
+        if query and not matches:
+            nothing = label(f"No folders match '{self.search.text().strip()}'", "faint")
+            nothing.setContentsMargins(16, 10, 0, 10)
+            rows.addWidget(nothing)
+            row_count = 1
         rows.addStretch(1)
-        position = self.scroll.verticalScrollBar().value()
+        position = 0 if scroll_to_top else self.scroll.verticalScrollBar().value()
         self.scroll.setWidget(holder)
         holder.adjustSize()
 
@@ -830,7 +954,7 @@ class FolderListPopup(QWidget):
         app = self.app
         anchor = app.folder_bar
         row_height = max(metrics.height() + 10, holder.sizeHint().height() // max(1, row_count))
-        height = max(60, min(440, row_count * row_height + 14))
+        height = max(60, min(440, row_count * row_height + 14)) + self.search.sizeHint().height() + 8
         needed = holder.sizeHint().width() + self.scroll.verticalScrollBar().sizeHint().width() + 16
         window = app.geometry()
         width = max(anchor.width(), self._width, min(max(needed, 460), 760, window.width() - 16))
@@ -839,6 +963,10 @@ class FolderListPopup(QWidget):
         left = max(window.left() + 8, min(corner.x(), window.right() - 8 - width))
         self.setGeometry(left, corner.y(), width, height)
         self.scroll.verticalScrollBar().setValue(position)
+
+    def _open_first_match(self):
+        if self._first_match:
+            self.jump_to(self._first_match)
 
     def _branch_button(self, open_them, index, norms):
         widget = button("+" if open_them else "−", "mini", "Open all sub-folders" if open_them else "Close all sub-folders",
@@ -890,6 +1018,13 @@ class FolderListPopup(QWidget):
         key = event.key()
         self._ctrl_armed = key == Qt.Key.Key_Control and not event.isAutoRepeat()
         plain = not (event.modifiers() & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier))
+        text = event.text()
+        hover_key = key in (Qt.Key.Key_D, Qt.Key.Key_U) and self.hovered is not None
+        if plain and text and text.isprintable() and not hover_key:
+            self.search.setFocus()          # start (or carry on) searching
+            self.search.insert(text)
+            event.accept()
+            return
         if key in (Qt.Key.Key_D, Qt.Key.Key_U) and plain and not event.isAutoRepeat():
             folders = self.hovered_branch()
             if folders:
@@ -948,18 +1083,24 @@ class ImageOrganizationToolkit(QMainWindow):
         self.down_target = 1800
         self.up_target = 1800
         self.jpg_quality = 90
-        self.target_resolution = 1800
         self.thumb_size = 201
         self.rename_var = Var(True)
         self.skip_folder_var = Var(False)
         self.cache_deletion_var = Var(True)   # "Cache Deletion": the thumbnail cache is deleted on close unless unticked
         self.flags_enabled = {"target": True, "size": True, "modified": True}  # folder flags shown (Settings)
-        self.frost_preview = True         # frosted screen behind the Hover + Hold Z preview (Settings)
-        self.base_image = 5               # checks use the Nth picture, so covers / thumbnails at the start are skipped
+        self.frost_preview = True         # frosted screen behind the Hover + Z preview (Settings)
+        self.ignore_files = 4             # the first files of a folder (covers, thumbnails) skipped by the checks
         self.tree_show_sizes = True       # folder sizes in the folder list (Settings)
         self.strip_exif = False           # resized images saved without EXIF (camera model, GPS...) (Settings)
         self.scroll_speed = 100           # % of the normal mouse-wheel step in the picture grid (Settings)
         self.zip_destination = ""         # where Compress Folder (C) puts zips; empty = next to the folder (Settings)
+        self.sort_mode = "name"           # the grid's order: name / taken / modified / size (right-click > Sort by)
+        self.hover_size = True            # hover tip extras (Settings): file size...
+        self.hover_taken = False          # ...date taken...
+        self.hover_camera = False         # ...and camera
+        self.offer_empty_delete = True    # offer to delete a folder you've just emptied (Settings)
+        self.use_recycle_bin = False      # on closing, deleted files go to the Recycle Bin instead (Settings)
+        self.offer_existing_folders = False   # range moves can go into an existing folder too (Settings; off)
         # Which actions ask "are you sure?" first (Settings > Confirmations); defaults are I.O.T's own workflow
         self.confirmations = {key: default for key, _, _, default in iot_dialogs.CONFIRMATIONS}
         self.theme_name = self.load_settings()
@@ -993,6 +1134,15 @@ class ImageOrganizationToolkit(QMainWindow):
         self.group_mode = False           # G: pick any pictures, Enter copies them into a folder
         self.group_picks = {}             # filename -> None, in the order they were picked
         self._click_undo = None           # (index, undo) for the last click that only marked a picture (double-click)
+        self._photo_info = {}             # (path, mtime) -> (date taken, camera), for Sort by date and the hover tip
+        self._stash_origins = {}          # recycle-folder path -> where the file came from (for the Recycle Bin option)
+        self._held_key = None             # 'compress' (C) / 'rename' (R) while that key is held: a click on a picture
+        self._held_used = False           # acts on the selection up to it, and then letting go does nothing more
+        self._no_dupes = set()            # folders F found no duplicates in (this session; any change there clears it)
+        self._ripple_timer = None         # the Easter egg (click inside the O of the title)
+        self._ripple_last = None
+        self._preview_idx = None          # the picture the Zoom preview shows
+        self._preview_frost = None
         self.image_cache = OrderedDict()  # (folder, filename, pixel size) -> QPixmap, least recently used first
         self.dims_cache = {}              # (folder, filename) -> original (w, h)
         self._failed_thumbs = set()       # (folder, filename) that couldn't be decoded; not retried
@@ -1000,7 +1150,6 @@ class ImageOrganizationToolkit(QMainWindow):
         self.hovered_filename = None
         self.preview_window = None
         self._frost_pool = ThreadPoolExecutor(max_workers=1)
-        self.z_key_is_pressed = False
         self.active_duplicate_filename = None
         self.busy = False             # True while a background batch (resize / duplicate scan) runs
         self.tree_popup_window = None
@@ -1040,6 +1189,12 @@ class ImageOrganizationToolkit(QMainWindow):
 
     # ------------------------------------------------------------------ setup helpers
 
+    @property
+    def base_image(self):
+        """The first picture after the ignored ones (1-based): what the resolution check, the rename suggestion and the
+        resize estimate look at."""
+        return self.ignore_files + 1
+
     def _resolve_start_folder(self):
         # 1. An explicit directory handed over as a command-line argument
         if len(sys.argv) > 1 and os.path.isdir(sys.argv[1]):
@@ -1063,7 +1218,6 @@ class ImageOrganizationToolkit(QMainWindow):
             self.down_target = int(data.get("down_target", self.down_target))
             self.up_target = int(data.get("up_target", self.up_target))
             self.jpg_quality = max(1, min(100, int(data.get("jpg_quality", self.jpg_quality))))
-            self.target_resolution = int(data.get("target_resolution", self.target_resolution))
             self.thumb_size = max(60, min(300, int(data.get("thumb_size", self.thumb_size))))
             self.rename_var.set(bool(data.get("sequential_rename", True)))
             self.skip_folder_var.set(bool(data.get("skip_folder_creation", False)))
@@ -1072,11 +1226,22 @@ class ImageOrganizationToolkit(QMainWindow):
             elif "disable_cache_deletion" in data:   # the old, reversed option: keep what was chosen with it
                 self.cache_deletion_var.set(not bool(data["disable_cache_deletion"]))
             self.frost_preview = bool(data.get("frosted_preview", True))
-            self.base_image = max(1, int(data.get("base_image", self.base_image)))
+            if "ignore_files" in data:
+                self.ignore_files = max(0, int(data["ignore_files"]))
+            elif "base_image" in data:   # the old setting: "the Nth picture" = skip the N - 1 before it
+                self.ignore_files = max(0, int(data["base_image"]) - 1)
             self.tree_show_sizes = bool(data.get("tree_show_sizes", True))
             self.strip_exif = bool(data.get("strip_exif", False))
             self.scroll_speed = max(50, min(400, round(int(data.get("scroll_speed", 100)) / 10) * 10))  # 50-400% in 10% steps
             self.zip_destination = str(data.get("zip_destination") or "")
+            if data.get("sort_by") in {key for key, _ in SORT_MODES}:
+                self.sort_mode = data["sort_by"]
+            self.hover_size = bool(data.get("hover_file_size", True))
+            self.hover_taken = bool(data.get("hover_date_taken", False))
+            self.hover_camera = bool(data.get("hover_camera", False))
+            self.offer_empty_delete = bool(data.get("offer_empty_folder_delete", True))
+            self.use_recycle_bin = bool(data.get("use_recycle_bin", False))
+            self.offer_existing_folders = bool(data.get("offer_existing_folders", False))
             saved_confirmations = data.get("confirmations", {})
             if isinstance(saved_confirmations, dict):
                 for key in self.confirmations:
@@ -1096,21 +1261,26 @@ class ImageOrganizationToolkit(QMainWindow):
             "sequential_rename": self.rename_var.get(),
             "skip_folder_creation": self.skip_folder_var.get(),
             "cache_deletion": self.cache_deletion_var.get(),
-            "disable_cache_deletion": not self.cache_deletion_var.get(),   # the same, for the Tk version
             "folder_flags": dict(self.flags_enabled),
             "frosted_preview": self.frost_preview,
-            "base_image": self.base_image,
+            "ignore_files": self.ignore_files,
             "tree_show_sizes": self.tree_show_sizes,
             "strip_exif": self.strip_exif,
             "scroll_speed": self.scroll_speed,
             "zip_destination": self.zip_destination,
+            "sort_by": self.sort_mode,
+            "hover_file_size": self.hover_size,
+            "hover_date_taken": self.hover_taken,
+            "hover_camera": self.hover_camera,
+            "offer_empty_folder_delete": self.offer_empty_delete,
+            "use_recycle_bin": self.use_recycle_bin,
+            "offer_existing_folders": self.offer_existing_folders,
             "confirmations": dict(self.confirmations),
             "thumb_size": self.thumb_size,
             "anomaly_threshold": self.anomaly_threshold_var.get(),
             "down_target": self.down_target,
             "up_target": self.up_target,
             "jpg_quality": self.jpg_quality,
-            "target_resolution": self.target_resolution,
         }
 
     def save_settings(self):
@@ -1130,8 +1300,10 @@ class ImageOrganizationToolkit(QMainWindow):
                 on_disk = {}
             if isinstance(on_disk, dict):
                 for key, value in on_disk.items():
+                    if key in RETIRED_SETTINGS:
+                        continue   # replaced by a newer setting (already read in load_settings): not written back
                     if key not in data:
-                        data[key] = value  # a setting this version doesn't use (e.g. the Tk version's): keep it
+                        data[key] = value  # a setting this version doesn't use (an older or newer one's): keep it
                     elif key in base and data[key] == base[key]:
                         data[key] = value  # unchanged here: keep the other window's value
         temp = SETTINGS_FILE + ".tmp"
@@ -1147,7 +1319,7 @@ class ImageOrganizationToolkit(QMainWindow):
     # ------------------------------------------------------------------ folder tree scanning
 
     def scan_entire_directory_tree(self):
-        """Walks the whole folder tree once and computes the 🎯 / ❗ / ⚑ flags. After a change inside
+        """Walks the whole folder tree once and computes the resize / ❗ / ⚑ flags. After a change inside
         folders that are already known, refresh_folders() is much cheaper."""
         folders = []
 
@@ -1162,8 +1334,8 @@ class ImageOrganizationToolkit(QMainWindow):
                 "bytes": total_bytes,
                 "image_count": len(images),
                 "subdirs": subdirs,
-                "res_mismatch": self._check_resolution_mismatch(path, images),
             }
+            info.update(self._resolution_flags(path, images))
             folders.append(info)
             subtree_total, subtree_bytes = len(images), total_bytes
             if depth < 40:  # guards against junction/symlink loops
@@ -1189,6 +1361,8 @@ class ImageOrganizationToolkit(QMainWindow):
         renamed, since the tree itself changed.
         """
         recycle = iot_history.RECYCLE_DIR_NAME
+        for path in paths:   # something changed there: F looks again
+            getattr(self, "_no_dupes", set()).discard(path)
         for path in dict.fromkeys(p for p in paths if p and recycle not in os.path.normcase(p)
                                   and iot_history._same_or_inside(p, self.parent_hub)):   # outside the hub: not ours
             info = self.folder_info.get(path)
@@ -1201,8 +1375,7 @@ class ImageOrganizationToolkit(QMainWindow):
                 self.scan_entire_directory_tree()
                 return
             image_change, byte_change = len(images) - info["image_count"], total_bytes - info["bytes"]
-            info.update(bytes=total_bytes, image_count=len(images),
-                        res_mismatch=self._check_resolution_mismatch(path, images))
+            info.update(bytes=total_bytes, image_count=len(images), **self._resolution_flags(path, images))
             node = info
             while node is not None:  # this folder and every folder above it, up to the hub
                 node["total_image_count"] += image_change
@@ -1224,10 +1397,39 @@ class ImageOrganizationToolkit(QMainWindow):
             info["modified"] = info["path"] in self.modified_folders
             info["oversize"] = (not info["modified"]) and average_subfolder_size > 0 and info["bytes"] > max_allowed_threshold
 
-    def _check_resolution_mismatch(self, folder, images):
-        n = self.base_image  # Settings > Base image
+    def _resolution_flags(self, folder, images):
+        """short_edge = the short edge of the folder's check picture (the first after the ignored ones; None = nothing
+        to check). It decides the resize flags and which of Downscale / Upscale is available (resize_needed)."""
+        size = self._base_image_size(folder, images)
+        return {"short_edge": min(size) if size else None}
+
+    def resize_needed(self, mode, edge):
+        """A short edge above the Downscale size needs Downscale, below the Upscale size Upscale."""
+        return edge > self.down_target if mode == "down" else edge < self.up_target
+
+    def resize_allowed(self, mode, folder=None):
+        """Only the direction the folder needs is allowed (a fast-workflow guide, the same rule as the resize flags);
+        with nothing to check, both are."""
+        info = self.folder_info.get(self.image_folder if folder is None else folder)
+        edge = info.get("short_edge") if info else None
+        return edge is None or self.resize_needed(mode, edge)
+
+    def _resize_blocked_text(self, mode, folder=None):
+        info = self.folder_info.get(self.image_folder if folder is None else folder)
+        edge = info["short_edge"]
+        other = "up" if mode == "down" else "down"
+        where = f"this folder's first picture after the ignored ones is {edge} px on the short edge"
+        if self.resize_needed(other, edge):
+            return (f"{'Downscale' if mode == 'down' else 'Upscale'} isn't needed: {where}, so "
+                    f"{'Upscale (U)' if other == 'up' else 'Downscale (D)'} is the one to use.")
+        return f"Nothing to resize: {where}, which already fits your Downscale / Upscale sizes (Settings)."
+
+    def _base_image_size(self, folder, images):
+        """(w, h) of the first picture after Settings > Processing > Ignore files, or None / False if there's none
+        or it can't be read. Cached per path + mtime."""
+        n = self.base_image
         if len(images) < n:
-            return False
+            return None
         base_name, mtime = heapq.nsmallest(n, images, key=lambda item: iot_utils.natural_sort_key(item[0]))[n - 1]
         image_path = os.path.join(folder, base_name)
         cache_key = (image_path, mtime)
@@ -1238,18 +1440,16 @@ class ImageOrganizationToolkit(QMainWindow):
             except Exception:
                 size = False
             self._resolution_cache[cache_key] = size
-        if not size:
-            return False
-        w, h = size
-        return w != self.target_resolution and h != self.target_resolution
+        return size
 
     def _folder_flags(self, info):
         if not info:
             return ""
         parts = []
         enabled = self.flags_enabled
-        if info["res_mismatch"] and enabled["target"]:
-            parts.append(FLAG_TARGET)
+        edge = info.get("short_edge")
+        if edge is not None and enabled["target"]:   # which way the folder needs resizing
+            parts += [flag for mode, flag in (("down", FLAG_DOWN), ("up", FLAG_UP)) if self.resize_needed(mode, edge)]
         if info["modified"]:
             if enabled["modified"]:
                 parts.append(FLAG_MODIFIED)
@@ -1286,6 +1486,16 @@ class ImageOrganizationToolkit(QMainWindow):
         tag = self.folder_tag(self.image_folder)
         self.folder_bar.set_folder(path_text, name, self._folder_flags(info).strip(), count_text,
                                    P["tag_" + tag] if tag else None, pending)
+        if hasattr(self, "dupe_button"):   # greyed out where F found nothing (until something changes there)
+            checked = self.image_folder in self._no_dupes
+            self.dupe_button.setEnabled(not checked)
+            self.dupe_button.setToolTip("No duplicates found in this folder (it's checked again once anything changes "
+                                        "here, or after Refresh)" if checked else self._dupe_tip)
+        if hasattr(self, "resize_buttons"):   # only the one that's needed: above target = Downscale, below = Upscale
+            for (widget, tip), mode in zip(self.resize_buttons, ("down", "up")):
+                allowed = self.resize_allowed(mode)
+                widget.setEnabled(allowed)
+                widget.setToolTip(tip if allowed else self._resize_blocked_text(mode))
         self._update_status_info()
 
     @staticmethod
@@ -1307,7 +1517,8 @@ class ImageOrganizationToolkit(QMainWindow):
         head.setSpacing(10)
         titles = QVBoxLayout()
         titles.setSpacing(0)
-        titles.addWidget(label(APP_NAME, "title"))
+        self.title_label = _TitleLabel(self)
+        titles.addWidget(self.title_label)
         titles.addWidget(label(APP_SUBTITLE.upper(), "subtitle"))
         head.addLayout(titles)
         head.addSpacing(24)
@@ -1316,7 +1527,17 @@ class ImageOrganizationToolkit(QMainWindow):
         self.folder_bar.right_clicked.connect(self._open_tag_picker_for_selector)
         self.folder_bar.setToolTip("Click: the folder list  ·  Right-click: tag this folder  ·  Drop a folder onto the "
                                    "window to open it")
-        head.addWidget(self.folder_bar, 1)
+        # The folder box with its Browse button beside it: they move together (see _fit_header)
+        self._folder_box, folder_row = transparent_box(QHBoxLayout, 8)
+        folder_row.addWidget(self.folder_bar, 1)
+        self.browse_button = button("", "browse", "Choose a folder to open (as if dropped onto the window: a folder "
+                                    "with sub-folders becomes the new hub)", self.browse_for_folder)
+        self.browse_button.setFixedWidth(52)
+        self.browse_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        self.browse_button.setIconSize(QSize(24, 20))
+        self.browse_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        folder_row.addWidget(self.browse_button)
+        head.addWidget(self._folder_box, 1)
         self._head_gap = QWidget()          # takes the folder box's place when it moves to its own row
         self._head_gap.setObjectName("transparent")
         self._head_gap.hide()
@@ -1325,7 +1546,7 @@ class ImageOrganizationToolkit(QMainWindow):
         self._head = head
         self.undo_button = button("Undo", "", f"Recent changes, each with Revert  ({UNDO_KEYS} undoes the latest)",
                                   self.show_undo_window)
-        self.change_log_button = button("Change Log", "ghost", "Every change I.O.T has made, in a text file",
+        self.change_log_button = button("Log", "ghost", "Change log: every change I.O.T has made, in a text file",
                                         self.open_change_log)
         self.settings_button = button("Settings", "ghost", "Shortcuts, folder flags and processing options",
                                       self.open_settings)
@@ -1405,21 +1626,27 @@ class ImageOrganizationToolkit(QMainWindow):
 
     def _tools_group(self):
         self._tool_texts = []   # (button, full text, short text): narrow windows drop the key hints
+        self.resize_buttons = []   # (button, normal tooltip): greyed out where the folder is already at target
         box, row = transparent_box(QHBoxLayout, 5)
         row.addWidget(caps("Tools"))
         row.addSpacing(4)
         # Alphabetical; Group carries the animated border, Zoom is shown as a feature (not clickable)
         for text, key, command, tip in (
-                ("Compress Folder", "C", self.trigger_compress_folder, "Make a zip of this folder, sub-folders "
-                                                                       "included (Settings: where it goes)"),
+                ("Compress", "C", self.trigger_compress_folder, "Make a zip of this folder, sub-folders included. With "
+                                                                "a range start or group picks marked, hold C and click "
+                                                                "the last picture to zip just those"),
                 ("Delete Folder", "Q", self.trigger_folder_delete, "Delete this folder when I.O.T closes (Q again or "
                                                                    "Undo keeps it)"),
                 ("Downscale", "D", lambda: self.run_resizer("down"), "Shrink this folder's images (Settings: short edge)"),
-                ("Find Dupe", "F", self.trigger_duplicate_hash_scan, "Find duplicates of the base image (98%+ match)"),
+                ("Find Dupe", "F", self.trigger_duplicate_hash_scan, "Find duplicates in this folder (98%+ alike): each "
+                                                                     "set side by side, to keep or delete copies"),
                 ("Group", "G", None, ""),
-                ("Rename Folder", "R", self.trigger_active_folder_rename, "Rename the folder on screen"),
+                ("Rename", "R", self.trigger_active_folder_rename, "Rename the folder on screen. With a range start "
+                                                                   "or group picks marked, hold R and click the last "
+                                                                   "picture to rename just those"),
                 ("Upscale", "U", lambda: self.run_resizer("up"), "Enlarge this folder's images (Settings: short edge)"),
-                ("Zoom", "Hold Z", None, "Hover over a picture and hold Z for a full-screen view")):
+                ("Zoom", "Z", None, "Hover over a picture and press Z for a full-screen view (← / → for the "
+                                    "previous / next, Z or Esc closes it)")):
             if text == "Group":
                 self.group_button = GroupButton("Group · G")
                 self.group_button.setObjectName("tool")
@@ -1432,9 +1659,13 @@ class ImageOrganizationToolkit(QMainWindow):
                 row.addWidget(self.group_button)
                 continue
             widget = button(f"{text} · {key}", "tool" if command else "toolstatic", tip, command)
-            self._tool_texts.append((widget, f"{text} · {key}", "Zoom · Hold Z" if command is None else text))
+            if text == "Find Dupe":
+                self.dupe_button, self._dupe_tip = widget, tip
+            self._tool_texts.append((widget, f"{text} · {key}", f"{text} · {key}" if command is None else text))
             if key not in tip:
                 widget.setToolTip(f"{tip}  ({key})")
+            if text in ("Downscale", "Upscale"):
+                self.resize_buttons.append((widget, widget.toolTip()))
             widget.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             if command is None:
                 widget.setCursor(Qt.CursorShape.ArrowCursor)
@@ -1470,6 +1701,7 @@ class ImageOrganizationToolkit(QMainWindow):
         self.theme_button.setToolTip("Switch to the light theme" if self.theme_name == "dark" else
                                      "Switch to the dark theme")
         self.folder_bar.paint_icon()
+        self.browse_button.setIcon(folder_icon(24, 20))
         self._draw_status_dot()
         self._sync_half_button()
         self.grid.refresh_colours()
@@ -1498,6 +1730,8 @@ class ImageOrganizationToolkit(QMainWindow):
                 self.root.controls.sync()
             self._sync_half_button()
             self.root.update()
+        elif event.type() == QEvent.Type.ActivationChange and not self.isActiveWindow():
+            self._held_key = None   # the key's release may go to another window
         elif event.type() == QEvent.Type.ActivationChange and self.isActiveWindow():
             self._heal_thumbnails(retry_now=True)   # e.g. back from Explorer after a drive woke up
 
@@ -1517,20 +1751,51 @@ class ImageOrganizationToolkit(QMainWindow):
         if not hasattr(self, "_folder_row"):
             return
         narrow = self.width() < 1300
-        if narrow != (self._folder_row.indexOf(self.folder_bar) >= 0):
+        box = self._folder_box   # the folder box and its Browse button
+        if narrow != (self._folder_row.indexOf(box) >= 0):
             if narrow:
-                self._head.removeWidget(self.folder_bar)
-                self._folder_row.addWidget(self.folder_bar)
+                self._head.removeWidget(box)
+                self._folder_row.addWidget(box)
             else:
-                self._folder_row.removeWidget(self.folder_bar)
-                self._head.insertWidget(self._head.indexOf(self._head_gap), self.folder_bar, 1)
+                self._folder_row.removeWidget(box)
+                self._head.insertWidget(self._head.indexOf(self._head_gap), box, 1)
             self._head_gap.setVisible(narrow)
         compact = narrow and self.width() < 1100
         for widget, full, short in self._tool_texts:
             widget.setText(short if compact else full)
-            if full.startswith("Zoom"):   # only a reminder of Hold Z, not a button: dropped when space is short
+            if full.startswith("Zoom"):   # only a reminder of Hover + Z, not a button: dropped when space is short
                 widget.setVisible(not compact)
         self._refresh_group_button()
+
+    # ------------------------------------------------------------------ ripples (an Easter egg: click the O)
+
+    def toggle_ripples(self):
+        if self._ripple_timer is None:
+            self._ripple_timer = QTimer(self, interval=30)
+            self._ripple_timer.timeout.connect(self._ripple_follow)
+        if self._ripple_timer.isActive():
+            self._ripple_timer.stop()
+            self.log_status("The water settles.", "info")
+        else:
+            self._ripple_last = None
+            self._ripple_timer.start()
+            self.log_status("Ripples on: move the pointer over the window. Click the O again to stop them.", "info")
+
+    def ripples_on(self):
+        return self._ripple_timer is not None and self._ripple_timer.isActive()
+
+    def _ripple_follow(self):
+        """Every 30 ms while the ripples are on: a new ring where the pointer is, once it has moved a little."""
+        if not self.isActiveWindow():
+            return
+        point = self.root.mapFromGlobal(QCursor.pos())
+        if not self.root.rect().contains(point):
+            return
+        last = self._ripple_last
+        if last is not None and (point - last).manhattanLength() < 14:
+            return
+        self._ripple_last = point
+        self.root.add_ripple(point)
 
     # ------------------------------------------------------------------ status line
 
@@ -1568,6 +1833,8 @@ class ImageOrganizationToolkit(QMainWindow):
         text = f"{count} image{'s' if count != 1 else ''}"
         if info:
             text += f"  ·  {format_bytes(info['bytes'])}"
+        if self.sort_mode != "name":
+            text += "  ·  by " + dict(SORT_MODES)[self.sort_mode].lower()
         self.status_info_label.setText(text)
         if self.group_mode:
             picked = len(self.group_picks)
@@ -1638,14 +1905,20 @@ class ImageOrganizationToolkit(QMainWindow):
         command("Top", None, lambda: self.grid.scroll_to(0), jump)
         command("Middle", None, self.handle_jump_to_middle_scroll, jump)
         command("Bottom", None, lambda: self.grid.scroll_to(self.grid.scrollbar.maximum()), jump)
+        sort = menu.addMenu("Sort by")
+        self._sort_actions = {}
+        for key, text in SORT_MODES:
+            action = sort.addAction(text, lambda k=key: self.set_sort_mode(k))
+            action.setCheckable(True)
+            self._sort_actions[key] = action
         tools = menu.addMenu("Tools")
-        command("Compress Folder", "C", self.trigger_compress_folder, tools)
+        command("Compress", "C", self.trigger_compress_folder, tools)
         command("Delete Folder", "Q", self.trigger_folder_delete, tools)
-        command("Downscale Images", "D", lambda: self.run_resizer("down"), tools)
+        self._resize_actions = {"down": command("Downscale Images", "D", lambda: self.run_resizer("down"), tools)}
         command("Find Duplicates", "F", self.trigger_duplicate_hash_scan, tools)
         command("Group Select", "G", self.toggle_group_mode, tools)
-        command("Rename Folder", "R", self.trigger_active_folder_rename, tools)
-        command("Upscale Images", "U", lambda: self.run_resizer("up"), tools)
+        command("Rename", "R", self.trigger_active_folder_rename, tools)
+        self._resize_actions["up"] = command("Upscale Images", "U", lambda: self.run_resizer("up"), tools)
         menu.addSeparator()
         self._menu_checks = []
         for text, var in (("Sequential Rename", self.rename_var), ("Skip Folder Creation", self.skip_folder_var),
@@ -1661,6 +1934,10 @@ class ImageOrganizationToolkit(QMainWindow):
     def show_context_menu(self, global_pos):
         for action, var in self._menu_checks:
             action.setChecked(bool(var.get()))
+        for key, action in self._sort_actions.items():
+            action.setChecked(key == self.sort_mode)
+        for mode, action in self._resize_actions.items():   # like the toolbar: only the direction that's needed
+            action.setEnabled(self.resize_allowed(mode))
         self.close_tooltip()
         self.context_menu.popup(global_pos)
 
@@ -1695,9 +1972,24 @@ class ImageOrganizationToolkit(QMainWindow):
             return True
         if mods:
             return False
+        if self.preview_window is not None:   # the Zoom preview is open: only its own keys
+            if not repeat and key in (K.Key_Z, K.Key_Escape):
+                self._close_preview()
+            elif key in (K.Key_Left, K.Key_Right):   # held down: keeps going
+                self.step_preview(-1 if key == K.Key_Left else 1)
+            return True
         if key == K.Key_Z:
             if not repeat:
                 self.handle_z_press()
+            return True
+        if key in (K.Key_C, K.Key_R):   # act on release; a click while held acts on the selection instead
+            if not repeat:
+                self._held_key, self._held_used = ("compress" if key == K.Key_C else "rename"), False
+            return True
+        if key in (K.Key_BracketLeft, K.Key_BracketRight):
+            if not repeat:
+                name = self.hovered_filename
+                later(lambda: self.rotate_pictures(key == K.Key_BracketRight, name))
             return True
         if key in (K.Key_W, K.Key_S):     # held down: keeps going through the folders
             self.shift_active_directory_index(-1 if key == K.Key_W else 1)
@@ -1710,8 +2002,7 @@ class ImageOrganizationToolkit(QMainWindow):
                 later(lambda: self.handle_keyboard_delete(name))
             return True
         actions = {K.Key_D: lambda: self.run_resizer("down"), K.Key_U: lambda: self.run_resizer("up"),
-                   K.Key_Q: self.trigger_folder_delete, K.Key_R: self.trigger_active_folder_rename,
-                   K.Key_C: self.trigger_compress_folder,
+                   K.Key_Q: self.trigger_folder_delete,
                    K.Key_F: self.trigger_duplicate_hash_scan, K.Key_G: self.toggle_group_mode,
                    K.Key_Return: self.copy_group_selection, K.Key_Enter: self.copy_group_selection,
                    K.Key_Escape: lambda: self.toggle_group_mode() if self.group_mode else None,
@@ -1724,10 +2015,13 @@ class ImageOrganizationToolkit(QMainWindow):
         return True
 
     def _key_released(self, event):
-        if event.key() == Qt.Key.Key_Z and not event.isAutoRepeat():
-            self.handle_z_release()
+        if event.key() in (Qt.Key.Key_C, Qt.Key.Key_R) and not event.isAutoRepeat():
+            held, used = self._held_key, self._held_used
+            self._held_key, self._held_used = None, False
+            if held and not used:   # a tap: the folder (or an explanation, if something's selected)
+                later(self.trigger_compress_folder if event.key() == Qt.Key.Key_C else self.trigger_active_folder_rename)
             return True
-        return False
+        return event.key() == Qt.Key.Key_Z   # (the preview opens and closes on presses)
 
     # ------------------------------------------------------------------ folder loading / navigation
 
@@ -1742,7 +2036,7 @@ class ImageOrganizationToolkit(QMainWindow):
         self._refresh_group_button()
         self.close_tooltip()
         self.last_folder_name = os.path.basename(target_path_directory.rstrip("\\/")) or "Sequence"
-        self.all_files = iot_utils.list_images(target_path_directory, self.valid_extensions)
+        self.all_files = self.list_folder(target_path_directory)
         self._rebuild_file_index()
         self.refresh_folder_button()
         self.grid.setFocus()
@@ -1750,6 +2044,93 @@ class ImageOrganizationToolkit(QMainWindow):
             self.render_grid()
             if anchor:
                 self._scroll_row_to_top(min(anchor, max(0, len(self.all_files) - 1)) // self.grid.cols)
+
+    # ------------------------------------------------------------------ sort order (right-click > Sort by)
+
+    def list_folder(self, folder):
+        """A folder's pictures in the grid's order (Sort by): name (natural order), date taken (pictures without one
+        go by their modified date), date modified, or size (largest first). Ties keep name order."""
+        names = iot_utils.list_images(folder, self.valid_extensions)
+        mode = self.sort_mode
+        if mode == "name" or len(names) < 2:
+            return names
+        stats = {}
+        for name in names:
+            try:
+                stats[name] = os.stat(os.path.join(folder, name))
+            except OSError:
+                stats[name] = None
+        if mode == "size":
+            return sorted(names, key=lambda n: -(stats[n].st_size if stats[n] else 0))   # sorted() keeps name order on ties
+        if mode == "modified":
+            return sorted(names, key=lambda n: stats[n].st_mtime if stats[n] else 0)
+
+        def taken(name):
+            stat = stats[name]
+            when = self._photo_info_for(os.path.join(folder, name), stat)[0] if stat else None
+            if when:
+                return when
+            return datetime.fromtimestamp(stat.st_mtime).strftime("%Y:%m:%d %H:%M:%S") if stat else ""
+        return sorted(names, key=taken)
+
+    def name_ordered_files(self):
+        """The folder on screen in name order: the base image is always the Nth by name, whatever the grid's order
+        (it's there to skip covers and thumbnails at the start of a folder)."""
+        if self.sort_mode == "name":
+            return list(self.all_files)
+        return sorted(self.all_files, key=iot_utils.natural_sort_key)
+
+    def set_sort_mode(self, mode):
+        if mode == self.sort_mode or mode not in dict(SORT_MODES):
+            return
+        self.sort_mode = mode
+        self.save_settings()
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)   # date taken reads every picture's header once
+        try:
+            self.load_directory_target_sequence(self.image_folder)
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.log_status(f"Sorted by {dict(SORT_MODES)[mode].lower()}.", "info")
+
+    def _photo_info_for(self, path, stat=None):
+        """(date taken, camera) for a picture, read once per version of the file."""
+        try:
+            stat = stat or os.stat(path)
+        except OSError:
+            return None, None
+        key = (path, stat.st_mtime_ns)
+        info = self._photo_info.get(key)
+        if info is None:
+            info = iot_utils.read_photo_info(path)
+            self._photo_info[key] = info
+        return info
+
+    def _hover_details(self, name):
+        """The lines under the name in the hover tip: pixel size, then what Settings has switched on."""
+        path = os.path.join(self.image_folder, name)
+        dims = self.dims_cache.get((self.image_folder, name))
+        lines = [f"{dims[0]} × {dims[1]} px" if dims else "Size unknown"]
+        if self.hover_size or self.hover_taken or self.hover_camera:
+            try:
+                stat = os.stat(path)
+            except OSError:
+                return lines
+            if self.hover_size:
+                lines[0] += f"  ·  {format_bytes(stat.st_size)}"
+            if self.hover_taken or self.hover_camera:
+                taken, camera = self._photo_info_for(path, stat)
+                if self.hover_taken:
+                    lines.append("Taken " + (self._readable_date(taken) if taken else "– not recorded"))
+                if self.hover_camera:
+                    lines.append(camera or "Camera not recorded")
+        return lines
+
+    @staticmethod
+    def _readable_date(exif_date):
+        try:
+            return datetime.strptime(exif_date[:19], "%Y:%m:%d %H:%M:%S").strftime("%d %b %Y, %H:%M").lstrip("0")
+        except ValueError:
+            return exif_date
 
     def refresh(self):
         """F5 / Refresh: picks up changes made outside I.O.T. Re-reads the whole folder tree and the folder
@@ -1759,6 +2140,7 @@ class ImageOrganizationToolkit(QMainWindow):
             return
         self._close_tree_popup()
         self.close_tooltip()
+        self._no_dupes.clear()   # files may have changed outside I.O.T: F checks again
         self._load_folder_tags()
         self.scan_entire_directory_tree()
         folder = self.image_folder
@@ -1778,7 +2160,7 @@ class ImageOrganizationToolkit(QMainWindow):
         if self._startup_done:
             self._sync_tiles_with_disk()
         else:
-            self.all_files = iot_utils.list_images(folder, self.valid_extensions)
+            self.all_files = self.list_folder(folder)
             self._rebuild_file_index()
         self.refresh_folder_button()
         self.log_status("Refreshed.", "success")
@@ -1789,6 +2171,7 @@ class ImageOrganizationToolkit(QMainWindow):
 
     def handle_anomaly_recalculation_event(self):
         """Called after settings change."""
+        self._no_dupes.clear()   # Ignore files may have changed which pictures F compares
         self._close_tree_popup()
         self.scan_entire_directory_tree()
         self.refresh_folder_button()
@@ -1825,6 +2208,18 @@ class ImageOrganizationToolkit(QMainWindow):
         paths = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
         event.acceptProposedAction()
         later(lambda: self.open_dropped_paths(paths))
+
+    def browse_for_folder(self):
+        """The folder button beside the folder box: pick a folder in the system's folder browser. It's then opened
+        exactly as if it had been dropped onto the window."""
+        if self.busy:
+            self.log_status("Please wait for the current batch to finish before opening another folder.", "warning")
+            return
+        self._close_tree_popup()
+        self.close_tooltip()
+        chosen = QFileDialog.getExistingDirectory(self, "Choose a folder to open", self.image_folder)
+        if chosen:
+            self.open_dropped_paths([os.path.normpath(chosen)])
 
     def open_dropped_paths(self, paths):
         """A folder dropped from Explorer / OneCommander: show it. Folders outside the hub, and any
@@ -1869,8 +2264,43 @@ class ImageOrganizationToolkit(QMainWindow):
         self.session = iot_history.Session(folder)
         self.disk_cache = iot_utils.ThumbDiskCache(self.cache_folder)
         self._thumb_loader.disk_cache = self.disk_cache
+        self._no_dupes.clear()
         self._load_folder_tags()
         self.scan_entire_directory_tree()
+
+    def _let_go_of_hub(self):
+        """Before the hub folder itself is renamed: Windows refuses while anything inside it is open, and that
+        includes this process's working folder (the hub, when OneCommander starts I.O.T there)."""
+        self._thumb_loader.reset()
+        try:
+            if iot_history._same_or_inside(os.getcwd(), self.parent_hub):
+                os.chdir(os.path.dirname(self.parent_hub.rstrip("\\/")))
+                self._back_into_hub = True
+        except OSError:
+            pass
+
+    def _hub_moved(self, old, new):
+        """The hub folder was renamed (or the rename undone): everything I.O.T keeps inside it follows, so the
+        recycle folder (undo), the thumbnail cache and the tags carry on working."""
+        def fix(path):
+            if isinstance(path, str) and iot_history._same_or_inside(path, old):
+                return new + path[len(old):]
+            return path
+        self._thumb_loader.reset()
+        self.parent_hub = new
+        self.cache_folder = fix(self.cache_folder)
+        self.output_base = fix(self.output_base)
+        self.session.root_dir, self.session.dir = fix(self.session.root_dir), fix(self.session.dir)
+        self.disk_cache.folder = fix(self.disk_cache.folder)
+        self._stash_origins = {fix(stash): fix(origin) for stash, origin in self._stash_origins.items()}
+        self._no_dupes = {fix(path) for path in self._no_dupes}
+        self._resolution_cache.clear()   # keyed by the old paths
+        if getattr(self, "_back_into_hub", False):
+            self._back_into_hub = False
+            try:
+                os.chdir(new)   # back inside, as at start-up
+            except OSError:
+                pass
 
     # ------------------------------------------------------------------ half-window toggle
 
@@ -2184,7 +2614,7 @@ class ImageOrganizationToolkit(QMainWindow):
         focus_idx: picture whose row should end up at the top (default: keep the current top row)
         """
         folder, px = self.image_folder, self._thumb_px()
-        new_files = iot_utils.list_images(folder, self.valid_extensions)
+        new_files = self.list_folder(folder)
         if rename_map:
             moved = {}
             for old_name, new_name in rename_map.items():
@@ -2223,9 +2653,8 @@ class ImageOrganizationToolkit(QMainWindow):
         self.hovered_filename = self.all_files[idx] if idx is not None else None
         if idx is None:
             self.tip.hide()
-        elif global_pos is not None and not self.z_key_is_pressed:
-            self.tip.show_at(self.hovered_filename, self.dims_cache.get((self.image_folder, self.hovered_filename)),
-                             global_pos)
+        elif global_pos is not None and self.preview_window is None:
+            self.tip.show_at(self.hovered_filename, self._hover_details(self.hovered_filename), global_pos)
 
     def close_tooltip(self):
         if hasattr(self, "tip"):
@@ -2239,49 +2668,81 @@ class ImageOrganizationToolkit(QMainWindow):
         return self.file_index.get(self.hovered_filename) if self.hovered_filename else None
 
     def handle_z_press(self):
-        if self.z_key_is_pressed or self.hovered_filename is None:
+        """Z: opens the full-screen preview of the picture under the pointer (Z again, Esc or a click closes it;
+        ← / → show the previous / next picture)."""
+        if self.preview_window is not None:
+            self._close_preview()
             return
-        self.z_key_is_pressed = True
+        idx = self.currently_hovered_idx
+        if idx is None:
+            return
         self.tip.hide()
-        path = os.path.join(self.image_folder, self.hovered_filename)
         try:
             screen = self.screen() or QGuiApplication.primaryScreen()
             area, ratio = screen.geometry(), screen.devicePixelRatio()
             width, height = int(area.width() * ratio), int(area.height() * ratio)
-            # The frosted backdrop is grabbed and blurred on a worker thread while the preview decodes
+            # The frosted backdrop is grabbed and blurred on a worker thread while the preview decodes; it's kept
+            # for the arrow keys, so stepping through pictures doesn't grab the screen again
             frost_job = None
             if self.frost_preview:
                 frost_job = self._frost_pool.submit(iot_utils.frosted_screen, width, height, P["grad_end"])
-            preview, _ = iot_utils.load_preview_image(path, width, height)   # the whole screen, over the taskbar
+            pixmap = self._preview_pixmap(idx, width, height, ratio)
             try:
                 frost = frost_job.result(timeout=1.0) if frost_job else None
             except Exception:
                 frost = None
-            pixmap = pil_to_pixmap(preview)
-            pixmap.setDevicePixelRatio(ratio)
-            frost_pixmap = pil_to_pixmap(frost) if frost is not None else None
-            self.preview_window = ZoomPreview(screen, pixmap, frost_pixmap)
+            self._preview_frost = pil_to_pixmap(frost) if frost is not None else None
+            self._preview_idx = idx
+            self.preview_window = ZoomPreview(screen, pixmap, self._preview_frost, on_click=self._close_preview)
             self.preview_window.show()
             self.preview_window.raise_()
         except Exception:
-            # Stay "held" until Z is let go, so a failure isn't retried on every key repeat
             self._close_preview()
+            self.log_status("Couldn't open that picture for the preview.", "error")
 
-    def handle_z_release(self):
-        self.z_key_is_pressed = False
-        self._close_preview()
+    def _preview_pixmap(self, idx, width, height, ratio):
+        preview, _ = iot_utils.load_preview_image(os.path.join(self.image_folder, self.all_files[idx]), width, height)
+        pixmap = pil_to_pixmap(preview)
+        pixmap.setDevicePixelRatio(ratio)
+        return pixmap
+
+    def step_preview(self, step):
+        """← / → in the preview: the previous / next picture of the folder (stops at the ends)."""
+        if self.preview_window is None or self._preview_idx is None:
+            return
+        idx = self._preview_idx + step
+        if not 0 <= idx < len(self.all_files):
+            return
+        screen = self.preview_window.screen() or QGuiApplication.primaryScreen()
+        area, ratio = screen.geometry(), screen.devicePixelRatio()
+        try:
+            pixmap = self._preview_pixmap(idx, int(area.width() * ratio), int(area.height() * ratio), ratio)
+        except Exception:
+            self.log_status(f"Couldn't open '{self.all_files[idx]}' for the preview.", "error")
+            return
+        self._preview_idx = idx
+        self.preview_window.set_pixmap(pixmap)
+
+    def handle_z_release(self):   # (kept for older scripts: the preview now closes on a second press)
+        pass
 
     def _close_preview(self):
         if self.preview_window is not None:
             self.preview_window.close()
             self.preview_window.deleteLater()
             self.preview_window = None
+        self._preview_idx = None
+        self._preview_frost = None
 
     # ------------------------------------------------------------------ history / undo
 
     time_ago = staticmethod(time_ago)
 
     def _record(self, kind, title, folder, steps, log_lines=(), target=None):
+        recycle = os.sep + iot_history.RECYCLE_DIR_NAME + os.sep
+        for step in steps:   # files moved into a recycle folder: where they came from (Recycle Bin option)
+            if step[0] == "move" and recycle in step[2]:
+                self._stash_origins[step[2]] = step[1]
         record = self.history.add(kind, title, folder, steps, log_lines, target)
         self._refresh_undo_button()
         self._refresh_undo_window()
@@ -2319,7 +2780,14 @@ class ImageOrganizationToolkit(QMainWindow):
             return
         self.close_tooltip()
         old_folder = self.image_folder
+        hub_renames = [step for step in record.steps
+                       if step[0] == "rename_dir" and self._norm(step[2]) == self._norm(self.parent_hub)]
+        if hub_renames:
+            self._let_go_of_hub()
         restored, problems, touched = self.history.undo(record)
+        for _, src, dst in hub_renames:
+            if os.path.isdir(src) and not os.path.isdir(dst):   # the hub got its old name back
+                self._hub_moved(dst, src)
 
         # A reverted folder rename moves the folder we may be looking at
         current = self.image_folder
@@ -2437,6 +2905,8 @@ class ImageOrganizationToolkit(QMainWindow):
         grid.update_range()
         self._update_view(force=True)
         self.refresh_folder_button()
+        if not self.all_files:
+            later(lambda f=folder: self._offer_empty_folder_delete(f))
         # The next picture has moved under the pointer: it's the one hovered now
         self.set_hover(grid.index_at(grid.mapFromGlobal(QCursor.pos())) if grid.underMouse() else None, QCursor.pos())
 
@@ -2446,8 +2916,7 @@ class ImageOrganizationToolkit(QMainWindow):
         idx = self.file_index.get(filename)
         if idx is None:
             return
-        self._set_selection(idx)
-        self._scroll_to_index(idx)
+        self._scroll_to_index(idx)   # its red outline (the duplicate highlight) shows which one; a click clears it
 
     def _scroll_to_index(self, idx):
         grid = self.grid
@@ -2465,6 +2934,10 @@ class ImageOrganizationToolkit(QMainWindow):
         self.close_tooltip()
         return dialogs.TextPrompt.ask(self, title, subtitle, field_label, default_value, confirm_text)
 
+    @staticmethod
+    def trash_available():
+        return send2trash is not None
+
     def asks(self, action):
         """True when this action should ask "are you sure?" first (Settings > Confirmations)."""
         return self.confirmations.get(action, True)
@@ -2475,14 +2948,22 @@ class ImageOrganizationToolkit(QMainWindow):
         return dialogs.confirm(self, title, f"{heading}\n\n{text}", confirm_text, danger=variant == "danger")
 
     def trigger_active_folder_rename(self):
+        """R (a tap) / the Rename button: renames the folder on screen. With a range start or group picks marked, it
+        explains how to rename just those instead."""
         if self.busy:
             return
-        if self.image_folder == self.parent_hub:
-            self._themed_notice("Can't rename the hub", "The parent hub folder can't be renamed while I.O.T is working inside it.")
+        if (self.group_mode and self.group_picks) or self.first_selected_idx is not None:
+            self.log_status("To rename just the selection, hold R and click the last picture. (To rename the folder, "
+                            "clear the selection first: Esc in group mode, or click the range start again.)", "info")
+            return
+        is_hub = self._norm(self.image_folder) == self._norm(self.parent_hub)
+        if is_hub and iot_history._same_or_inside(SCRIPT_DIR, self.parent_hub):
+            self._themed_notice("Can't rename the hub", "I.O.T itself (and its settings) is inside this folder, so it "
+                                                        "can't be renamed while I.O.T is running.")
             return
         default_suggestion_name = os.path.basename(self.image_folder)
         if len(self.all_files) >= self.base_image:
-            default_suggestion_name = os.path.splitext(self.all_files[self.base_image - 1])[0]
+            default_suggestion_name = os.path.splitext(self.name_ordered_files()[self.base_image - 1])[0]
         elif self.all_files:
             default_suggestion_name = os.path.splitext(self.all_files[-1])[0]
 
@@ -2502,11 +2983,16 @@ class ImageOrganizationToolkit(QMainWindow):
         if os.path.lexists(new_path):
             self._themed_notice("Name already used", f"A folder called '{clean_new_title}' already exists here.")
             return
+        if is_hub:
+            self._let_go_of_hub()
         try:
-            os.rename(old_path, new_path)
+            iot_history.retry_if_busy(os.rename, old_path, new_path)
         except OSError as disk_err:
-            self._themed_notice("Couldn't rename folder", str(disk_err))
+            self._themed_notice("Couldn't rename folder", f"{disk_err}\n\nAnother program (Explorer, an image viewer...) "
+                                                          "may have something inside it open.")
             return
+        if is_hub:
+            self._hub_moved(old_path, new_path)
         # Keep older undo records pointing at the right place, then record this rename
         self.history.rewrite_paths(old_path, new_path)
         self._record("Folder rename", f"Renamed folder '{os.path.basename(old_path)}' to '{clean_new_title}'",
@@ -2655,23 +3141,89 @@ class ImageOrganizationToolkit(QMainWindow):
                              "closes. Until then it stays, crossed out in the folder list; press Q again or Undo "
                              f"({UNDO_KEYS}) to keep it.", "Delete", "danger"):
             return
+        self._mark_for_deletion(folder, name, contents)
+
+    def _mark_for_deletion(self, folder, name, contents):
         self.pending_delete_folders.add(folder)
         self._record("Folder delete", f"Marked folder '{name}' for deletion", os.path.dirname(folder),
                      [("tag_delete", folder)], [f"{name}: {contents}, deleted when I.O.T closes"])
         self.refresh_folder_button()
         self.log_status(f"'{name}' will be deleted when I.O.T closes  (Q again or {UNDO_KEYS} keeps it)", "warning")
 
+    def _offer_empty_folder_delete(self, folder):
+        """After you've moved or deleted the last picture out of a folder (Settings: offer to delete folders you
+        empty): asks whether to delete it when I.O.T closes, like Q. Only for a folder that's now completely empty
+        (no files, no sub-folders) and was emptied by what you just did."""
+        if not self.offer_empty_delete or self.busy or folder != self.image_folder:
+            return
+        if self._norm(folder) == self._norm(self.parent_hub) or self._is_pending_delete(folder):
+            return
+        try:
+            if any(not entry.name.startswith(".") for entry in os.scandir(folder)):
+                return
+        except OSError:
+            return
+        name = os.path.basename(folder.rstrip("\\/")) or folder
+        dialog = MessageDialog(self, "Empty folder", f"'{name}' is empty now.\n\nDelete it when I.O.T closes? Until "
+                               "then it stays, crossed out in the folder list; Q or Undo keeps it.",
+                               buttons=("Delete When Closing", "Keep It"), primary=1, kind="question")
+        dialog.exec()
+        if dialog.choice == 0:
+            self._mark_for_deletion(folder, name, "empty")
+
     def _delete_pending_folders(self):
-        """On closing: permanently deletes the folders marked with Q (parents before their sub-folders)."""
+        """On closing: deletes the folders marked with Q (parents before their sub-folders): permanently, or into
+        the Recycle Bin when Settings says so."""
+        to_bin = self.use_recycle_bin and send2trash is not None
         for folder in sorted(self.pending_delete_folders, key=len):
             if not os.path.isdir(folder):
                 continue
             try:
-                shutil.rmtree(folder)
-                self.change_log.write("FOLDER DELETED", folder, ["Deleted when I.O.T closed"])
+                if to_bin:
+                    send2trash(folder)
+                    self.change_log.write("FOLDER SENT TO " + iot_platform.TRASH_NAME.upper(), folder,
+                                          ["When I.O.T closed"])
+                else:
+                    shutil.rmtree(folder)
+                    self.change_log.write("FOLDER DELETED", folder, ["Deleted when I.O.T closed"])
                 self._drop_folder_tags(folder)
-            except OSError as err:
+            except Exception as err:   # send2trash raises its own errors too
                 self.change_log.write("FOLDER DELETE FAILED", folder, [str(err)])
+
+    def _send_deleted_to_bin(self):
+        """Settings > Recycle Bin: the files deleted (or replaced by a resize / rotate) this session go to the
+        Recycle Bin from the folder they came from, so the bin's Restore puts them back where they were. A name
+        that's taken there now (a resized picture's original) gets ' (original)' added."""
+        sent, failed = [], []
+        for stash, origin in list(self._stash_origins.items()):
+            if not os.path.exists(stash):
+                continue   # undone: it's back in place already
+            target = origin
+            folder = os.path.dirname(origin)
+            if not os.path.isdir(folder):
+                target = stash   # its folder is gone (renamed, deleted): send it from the recycle folder instead
+            elif os.path.lexists(origin):
+                base, ext = os.path.splitext(os.path.basename(origin))
+                target = os.path.join(folder, f"{base} (original){ext}")
+                number = 2
+                while os.path.lexists(target):
+                    target = os.path.join(folder, f"{base} (original {number}){ext}")
+                    number += 1
+            try:
+                if target != stash:
+                    iot_history.move_file(stash, target)
+                send2trash(target)
+                sent.append(target)
+            except Exception as err:
+                failed.append(f"{os.path.basename(origin)}: {err}")
+                if target != stash and os.path.exists(target):
+                    try:
+                        iot_history.move_file(target, stash)   # couldn't go to the bin: deleted with the rest
+                    except OSError:
+                        pass
+        if sent or failed:
+            lines = [f"{len(sent)} file(s) sent to the {iot_platform.TRASH_NAME}"] + [f"Problem: {p}" for p in failed[:20]]
+            self.change_log.write("SENT TO " + iot_platform.TRASH_NAME.upper(), self.parent_hub, lines)
 
     # ------------------------------------------------------------------ rename a branch (folder list: Hover + Ctrl)
 
@@ -2685,7 +3237,7 @@ class ImageOrganizationToolkit(QMainWindow):
             return
         jobs = []
         for folder in folders:
-            names = iot_utils.list_images(folder, self.valid_extensions)
+            names = self.list_folder(folder)   # "in their current order": the order on screen
             tag = os.path.basename(folder.rstrip("\\/"))
             if not names or not tag or folder_name_problem(tag):
                 continue
@@ -2746,18 +3298,162 @@ class ImageOrganizationToolkit(QMainWindow):
     # ------------------------------------------------------------------ resizer
 
     def run_resizer(self, mode, folders=None):
-        """folders: resize these folders' images (a folder list branch); default: the folder on screen."""
+        """folders: resize these folders' images (a folder list branch); default: the folder on screen, where only
+        the needed direction is allowed (resize_allowed: the same as the greyed-out buttons)."""
+        if folders is None and not self.resize_allowed(mode):
+            self.log_status(self._resize_blocked_text(mode), "info")
+            return
         if not self.busy:
             self.close_tooltip()
             dialogs.run_resizer(self, mode, folders)
 
+    # ------------------------------------------------------------------ rotate (Hover + [ / ])
+
+    def rotate_pictures(self, clockwise, hovered=None):
+        """[ / ]: turns the picture under the pointer a quarter turn left / right; in group mode, every picked picture.
+        Lossless for JPEGs with an orientation tag (only the tag changes); others are turned and saved again. Undo
+        puts the originals back."""
+        if self.busy:
+            return
+        names = [n for n in self.group_picks if n in self.file_index] if self.group_mode and self.group_picks else []
+        if not names:
+            name = hovered or self.hovered_filename
+            if name is None or name not in self.file_index:
+                return
+            names = [name]
+        folder = self.image_folder
+        steps, rotated, lossy, animated, failed = [], [], 0, 0, []
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            for name in names:
+                status, file_steps, lossless = iot_tools._rotate_one(
+                    os.path.join(folder, name), clockwise, self.jpg_quality, self.session.stash_path)
+                if status == "rotated":
+                    steps.extend(file_steps)
+                    rotated.append(name)
+                    lossy += 0 if lossless else 1
+                elif status == "animated":
+                    animated += 1
+                else:
+                    failed.append(name)
+        finally:
+            QApplication.restoreOverrideCursor()
+        way = "right" if clockwise else "left"
+        if rotated:
+            title = f"Rotated {rotated[0]} {way}" if len(rotated) == 1 else f"Rotated {len(rotated)} pictures {way}"
+            lines = [iot_history.describe_range(rotated, "image") + f"  ->  a quarter turn {way}"]
+            if lossy:
+                lines.append(f"{lossy} saved again (no orientation tag to change)")
+            self._record("Rotate", title, folder, steps, lines)
+            self.modified_folders.add(folder)
+            self._forget_names(folder, set(rotated))
+            self.refresh_folders([folder])
+            self.refresh_folder_button()
+            self._update_view(force=True)
+        message = (f"Rotated {rotated[0]} {way}" if len(rotated) == 1 else f"Rotated {len(rotated)} pictures {way}") \
+            if rotated else "Nothing rotated"
+        if animated:
+            message += f"; {animated} animated left as they are"
+        if failed:
+            self.log_status(message + f"; couldn't rotate {failed[0]}" + (f" and {len(failed) - 1} more" if len(failed) > 1 else ""),
+                            "error")
+        elif rotated:
+            self.log_status(message + f"  ({UNDO_KEYS} to undo)", "success")
+        else:
+            self.log_status(message + ".", "warning")
+
     # ------------------------------------------------------------------ compress folder (C)
 
     def trigger_compress_folder(self):
-        """C: a zip of the folder on screen (see iot_qt_dialogs.run_compress)."""
-        if not self.busy:
-            self.close_tooltip()
-            dialogs.run_compress(self)
+        """C (a tap) / the Compress button: a zip of the folder on screen (see iot_qt_dialogs.run_compress). With a
+        range start or group picks marked, it explains how to zip just those instead of zipping the whole folder."""
+        if self.busy:
+            return
+        if (self.group_mode and self.group_picks) or self.first_selected_idx is not None:
+            self.log_status("To zip just the selection, hold C and click the last picture. (To zip the whole folder, "
+                            "clear the selection first: Esc in group mode, or click the range start again.)", "info")
+            return
+        self.close_tooltip()
+        dialogs.run_compress(self)
+
+    def _selection_up_to(self, clicked_idx):
+        """The pictures a hold-key click acts on: the range from its start to this picture, or (group mode) every
+        pick plus this one, in the grid's order. None when nothing is selected."""
+        clicked = self.all_files[clicked_idx]
+        if self.group_mode and self.group_picks:
+            names = [n for n in self.group_picks if n in self.file_index]
+            if clicked not in names:
+                names.append(clicked)
+            return sorted(names, key=lambda n: self.file_index[n])
+        if self.first_selected_idx is not None:
+            start, end = sorted((self.first_selected_idx, clicked_idx))
+            return self.all_files[start:end + 1]
+        return None
+
+    def rename_selection(self, clicked_idx):
+        """Hold R + click: renames the range (or the group picks + this picture) in place, '<name> - 01', '- 02'... in
+        the grid's order, after asking for the name. Returns False when nothing is selected."""
+        names = self._selection_up_to(clicked_idx)
+        if names is None:
+            return False
+        group = self.group_mode
+        tag = self._ask_text(f"Rename {len(names)} picture{'s' if len(names) != 1 else ''}",
+                             f"{names[0]}  →  {names[-1]}" if len(names) > 1 else names[0], "Name",
+                             (self.last_folder_name or "Sequence").strip(), "Rename")
+        tag = (tag or "").strip()
+        if not tag:
+            return True   # cancelled: the selection stays
+        problem = folder_name_problem(tag)
+        if problem:
+            self._themed_notice("Invalid name", problem)
+            return True
+        folder = self.image_folder
+        rename_map, errors, steps = self._move_batch(names, folder, tag, True)
+        moves = [s for s in steps if s[0] == "move"]
+        if moves:
+            self._record("Rename", f"Renamed {len(moves)} files as '{tag} - ##'", folder, steps,
+                         [iot_history.describe_range(os.path.basename(s[1]) for s in moves),
+                          "renamed to:  " + iot_history.describe_range(os.path.basename(s[2]) for s in moves)])
+            self.modified_folders.add(folder)
+        match = re.search(r'(\d+)$', tag)   # the next suggestion counts up, as for range moves
+        self.last_folder_name = (tag[:-len(match.group(1))] + str(int(match.group(1)) + 1).zfill(len(match.group(1)))
+                                 if match else tag)
+        if group:
+            self.toggle_group_mode()
+        self.first_selected_idx = None
+        self._sync_tiles_with_disk(rename_map)
+        self.refresh_folders([folder])
+        self.refresh_folder_button()
+        if errors:
+            self.log_status(f"{len(errors)} file(s) could not be renamed: {errors[0]}", "error")
+        else:
+            self.log_status(f"Renamed {len(moves)} files as '{tag} - ##'  ({UNDO_KEYS} to undo)", "success")
+        return True
+
+    def compress_selection(self, clicked_idx):
+        """Hold C + click: zips the range from its start to this picture, or (group mode) every pick plus this one.
+        Returns False when nothing is selected (the click is then an ordinary one)."""
+        folder_name = os.path.basename(self.image_folder.rstrip("\\/")) or "Pictures"
+        clicked = self.all_files[clicked_idx]
+        if self.group_mode and self.group_picks:
+            names = [n for n in self.group_picks if n in self.file_index]
+            if clicked not in names:
+                names.append(clicked)
+            names.sort(key=lambda n: self.file_index[n])   # in the grid's order
+            title = f"{folder_name} - Selection"
+            on_done = lambda: self.toggle_group_mode() if self.group_mode else None
+        elif self.first_selected_idx is not None:
+            start, end = sorted((self.first_selected_idx, clicked_idx))
+            names = self.all_files[start:end + 1]
+            first, last = os.path.splitext(names[0])[0], os.path.splitext(names[-1])[0]
+            title = f"{folder_name} - {first} to {last}" if len(names) > 1 else f"{folder_name} - {first}"
+            title = "".join("_" if c in INVALID_NAME_CHARS else c for c in title).rstrip(" .")
+            on_done = lambda: self._set_selection(None)
+        else:
+            return False
+        self.close_tooltip()
+        dialogs.run_compress(self, names, title, on_done)
+        return True
 
     # ------------------------------------------------------------------ duplicate scan
 
@@ -2774,22 +3470,26 @@ class ImageOrganizationToolkit(QMainWindow):
         return value
 
     def trigger_duplicate_hash_scan(self):
-        """Scans the active folder for visual twins (98%+ dHash match) of the base image, in parallel."""
+        """F: finds every set of near-identical pictures (98%+ alike) in the folder, skipping the ignored files at the
+        start (Settings > Processing), and opens them in the Duplicates window. Where none are found, F is greyed out
+        for that folder until something changes there (or Refresh). Hashes are remembered, so a re-check is quick."""
         if self.busy:
             return
-        n = self.base_image
-        if len(self.all_files) < n:
-            self._themed_notice("Find duplicates", f"Duplicates are found by comparing against the {iot_utils.ordinal(n)} "
-                                                   f"image (Settings > Base image), so the folder needs at least {n} images.")
+        folder = self.image_folder
+        if folder in self._no_dupes:
+            self.log_status("No duplicates in this folder (already checked). After changes made outside I.O.T, Refresh "
+                            "(F5) checks again.", "info")
+            return
+        ignored = set(self.name_ordered_files()[:self.ignore_files])
+        files = [name for name in self.all_files if name not in ignored]
+        if len(files) < 2:
+            self.log_status("Fewer than two pictures to compare here" +
+                            (f" (the first {self.ignore_files} are ignored: Settings > Processing)." if ignored else "."),
+                            "info")
             return
         self.close_tooltip()
-        folder = self.image_folder
-        files = list(self.all_files)
-        baseline_filename = files[n - 1]
-        baseline_full_path = os.path.join(folder, baseline_filename)
         progress = dialogs.ProgressDialog(self, "Finding duplicates",
-                                          f"Comparing every image with the {iot_utils.ordinal(n)} image (the base "
-                                          f"image):\n{baseline_filename}", len(files))
+                                          f"Comparing {len(files)} images with each other…", len(files))
         progress.show()
         self.busy = True
         executor = ThreadPoolExecutor(max_workers=max(2, min(8, os.cpu_count() or 4)), thread_name_prefix="iot-hash")
@@ -2806,31 +3506,88 @@ class ImageOrganizationToolkit(QMainWindow):
             timer.stop()
             progress.finish()
             self.busy = False
-            base_hash = futures[n - 1].result()
-            if base_hash is None:
-                self.log_status(f"Could not read the baseline image '{baseline_filename}'.", "error")
+            groups = self._duplicate_groups([future.result() for future in futures])
+            if not groups:
+                self._no_dupes.add(folder)
+                self.refresh_folder_button()
+                self.log_status("No duplicates (98%+ alike) in this folder.", "success")
                 return
-            matched_twin_paths = [baseline_full_path]
-            for path, future in zip(paths, futures):
-                if path == baseline_full_path:
-                    continue
-                comp_hash = future.result()
-                if comp_hash is not None and iot_utils.hamming_distance(base_hash, comp_hash) <= 1:
-                    matched_twin_paths.append(path)
-                    if len(matched_twin_paths) >= 5:
-                        break
-            if len(matched_twin_paths) <= 1:
-                self.log_status("No duplicates (98%+ match) found in this folder.", "info")
-                return
-            self.display_side_by_side_duplicates_window(matched_twin_paths)
+            sets = [[paths[i] for i in group] for group in groups]
+            later(lambda: self.show_duplicates(sets))
 
         timer.timeout.connect(poll)
         timer.start()
 
-    def display_side_by_side_duplicates_window(self, paths):
-        self.duplicates_window = dialogs.DuplicatesViewer(self, paths)
-        self.duplicates_window.show()
-        self.duplicates_window.activateWindow()
+    def show_duplicates(self, sets):
+        self.close_tooltip()
+        self.duplicates_window = dialogs.DuplicatesWindow(self, sets)
+        self.duplicates_window.exec()
+        self.duplicates_window = None
+
+    def delete_duplicate_copies(self, paths):
+        """The Duplicates window's Delete Unticked: the copies go to the recycle folder (one Undo brings them back).
+        Returns the paths actually deleted."""
+        folder = self.image_folder
+        steps, deleted = [], []
+        for path in paths:
+            try:
+                steps.append(self._stash(path))
+                deleted.append(path)
+            except OSError as err:
+                self.log_status(f"Could not delete {os.path.basename(path)}: {err}", "error")
+        if not deleted:
+            return []
+        names = [os.path.basename(p) for p in deleted]
+        title = f"Deleted duplicate {names[0]}" if len(names) == 1 else f"Deleted {len(names)} duplicates"
+        self._record("Delete", title, folder, steps, [iot_history.describe_range(names) + "  (duplicates)"])
+        self._forget_names(folder, set(names))
+        self._sync_tiles_with_disk()
+        self.refresh_folders([folder])
+        self.refresh_folder_button()
+        self.log_status(f"{title}  ({UNDO_KEYS} to undo)", "success")
+        return deleted
+
+    def show_picture(self, name):
+        """The Duplicates window's Show in Folder: scrolls the grid to the picture and outlines it for a moment."""
+        idx = self.file_index.get(name)
+        if idx is None:
+            return
+        self._scroll_to_index(idx)
+        self._set_duplicate_highlight(name)
+        QTimer.singleShot(2500, lambda: self._set_duplicate_highlight(None)
+                          if self.active_duplicate_filename == name else None)
+
+    def open_path_externally(self, path):
+        try:
+            open_with_system(path)
+        except Exception as err:
+            self.log_status(f"Couldn't open '{os.path.basename(path)}': {err}", "error")
+
+    @staticmethod
+    def _duplicate_groups(hashes):
+        """Sets of indexes whose 64-bit hashes differ in at most one bit (98%+ alike), each in grid order, sets in the
+        order of their first picture. Looks up each hash and its 64 one-bit neighbours, so even thousands of pictures
+        take a moment rather than comparing every pair."""
+        parent = list(range(len(hashes)))
+
+        def root(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+        seen = {}
+        for i, value in enumerate(hashes):
+            if value is None:
+                continue
+            for candidate in [value] + [value ^ (1 << bit) for bit in range(64)]:
+                for j in seen.get(candidate, ()):
+                    parent[root(i)] = root(j)
+            seen.setdefault(value, []).append(i)
+        sets = {}
+        for i, value in enumerate(hashes):
+            if value is not None:
+                sets.setdefault(root(i), []).append(i)
+        return sorted((sorted(group) for group in sets.values() if len(group) > 1), key=lambda g: g[0])
 
     # ------------------------------------------------------------------ group mode (G)
 
@@ -2931,6 +3688,17 @@ class ImageOrganizationToolkit(QMainWindow):
         if self.busy:
             return
         self._click_undo = None
+        if self.active_duplicate_filename is not None:   # a found duplicate's red outline goes with the next click
+            was = self.active_duplicate_filename
+            self._set_duplicate_highlight(None)
+            if was == self.all_files[clicked_idx] and mode == "click":
+                return   # a click on the highlighted picture just clears it
+        if mode in ("compress", "rename"):   # C / R held: act on the selection up to this picture
+            self._held_key, self._held_used = None, True   # (the key's release may go to a dialog)
+            action = self.compress_selection if mode == "compress" else self.rename_selection
+            if action(clicked_idx):
+                return
+            mode = "click"
         if self.group_mode:  # every kind of click just picks / unpicks in group mode
             self._toggle_group_pick(clicked_idx)
             self._click_undo = (clicked_idx, lambda: self._toggle_group_pick(clicked_idx))
@@ -2972,6 +3740,8 @@ class ImageOrganizationToolkit(QMainWindow):
                 self.log_status(f"Deleted {len(deleted)} files; {failed} could not be deleted.", "error")
             else:
                 self.log_status(f"Deleted {len(deleted)} files  ({UNDO_KEYS} to undo)", "success")
+            if not self.all_files:
+                later(lambda f=folder: self._offer_empty_folder_delete(f))
             return
 
         # Plain click and Ctrl+click both pick a two-picture range the same way: the first click marks
@@ -3015,6 +3785,9 @@ class ImageOrganizationToolkit(QMainWindow):
                                                             len(files_to_move), range_summary, is_skip_folder)
 
         self.close_tooltip()
+        if isinstance(folder_tag, tuple):   # an existing folder was picked
+            self._move_range_to_existing(files_to_move, folder_tag[1])
+            return
         folder_tag = (folder_tag or "").strip()
         if not folder_tag:
             self._set_selection(None)
@@ -3072,6 +3845,8 @@ class ImageOrganizationToolkit(QMainWindow):
             self.log_status(f"Renamed {len(files_to_move)} files as '{folder_tag} - ##'.", "success")
         else:
             self.log_status(f"Moved {len(files_to_move)} files to '{folder_tag}'.", "success")
+        if not self.all_files:
+            later(lambda f=source_dir: self._offer_empty_folder_delete(f))
 
     def open_image_externally(self, idx):
         """Double-click: opens the picture in the computer's default image viewer. The first click of the double-click
@@ -3088,6 +3863,33 @@ class ImageOrganizationToolkit(QMainWindow):
             self.log_status(f"Opened '{name}' in your default image viewer.", "info")
         except Exception as err:   # no viewer set for this file type, file gone...
             self.log_status(f"Couldn't open '{name}': {err}", "error")
+
+    def _move_range_to_existing(self, files, target_dir):
+        """Moves a range into a folder that's already in the hub, names unchanged (a name that's taken there gets the
+        usual 'dupe_' prefix). One Undo moves them back."""
+        source_dir = self.image_folder
+        name = os.path.basename(target_dir.rstrip("\\/")) or target_dir
+        rename_map, errors, steps = self._move_batch(files, target_dir, name, False)
+        moves = [s for s in steps if s[0] == "move"]
+        log_lines = [iot_history.describe_range(os.path.basename(s[1]) for s in moves) + f"  ->  {target_dir}"]
+        if errors:
+            log_lines.append(f"{len(errors)} file(s) could not be moved: " + "; ".join(errors[:5]))
+        if moves:
+            self._record("Move", f"Moved {len(moves)} files into '{name}'", source_dir, steps, log_lines,
+                         target=target_dir)
+            self.modified_folders.update({source_dir, target_dir})
+        self.first_selected_idx = None
+        self._sync_tiles_with_disk(rename_map)
+        self.grid.scroll_to(0)
+        self._update_view(force=True)
+        self.refresh_folders([source_dir, target_dir])
+        self.refresh_folder_button()
+        if errors:
+            self.log_status(f"{len(errors)} file(s) could not be moved: {errors[0]}", "error")
+        else:
+            self.log_status(f"Moved {len(moves)} files to '{name}'  ({UNDO_KEYS} to undo)", "success")
+        if not self.all_files:
+            later(lambda f=source_dir: self._offer_empty_folder_delete(f))
 
     def _move_batch(self, files, target_dir, tag, should_rename, source_dir=None):
         """
@@ -3140,12 +3942,21 @@ class ImageOrganizationToolkit(QMainWindow):
         return candidate
 
     def ask_custom_dark_folder_dialog(self, default_value, count, summary, is_skip_folder):
-        """Returns the entered name as a string, or None if cancelled."""
+        """Returns the entered name, None if cancelled, or ('existing', path) when an existing folder was picked
+        (Settings: offer existing folders when moving a range)."""
         if is_skip_folder:
             title, confirm_text = f"Rename {count} files", "Rename"
         else:
             title, confirm_text = f"Move {count} files into a folder", "Move"
-        return self._ask_text(title, summary, "Name", default_value, confirm_text)
+        extra = "Existing Folder…" if self.offer_existing_folders and not is_skip_folder else None
+        self.close_tooltip()
+        answer = dialogs.TextPrompt.ask(self, title, summary, "Name", default_value, confirm_text, extra)
+        if answer is dialogs.EXTRA:
+            path = dialogs.FolderPickerDialog.ask(self, f"Move {count} files into…",
+                                                  "Pick a folder in the hub. The pictures keep their names.",
+                                                  exclude=[self.image_folder])
+            return ("existing", path) if path else None
+        return answer
 
     # ------------------------------------------------------------------ shutdown
 
@@ -3165,6 +3976,8 @@ class ImageOrganizationToolkit(QMainWindow):
             return
         self.save_settings()
         self._thumb_loader.stop()
+        if self.use_recycle_bin and send2trash is not None:
+            self._send_deleted_to_bin()   # then the clean-up below only removes what's left (nothing, usually)
         self._delete_pending_folders()
         for session in [self.session] + [session for session, _ in self._retired_hubs]:
             session.cleanup()           # permanently removes this session's deleted files
@@ -3177,11 +3990,6 @@ class ImageOrganizationToolkit(QMainWindow):
         event.accept()
         QApplication.instance().quit()
 
-    def handle_manual_exit_cleanup(self):   # old name (Tk version)
-        self.close()
-
-
-DarkGridImageSorter = ImageOrganizationToolkit   # the Tk version's class name
 
 
 # ==================================================================== start-up

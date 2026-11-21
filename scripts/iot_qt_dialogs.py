@@ -1,25 +1,27 @@
 """
 I.O.T's windows other than the main one, in Qt: Settings, the Undo list, the small prompts, the progress
 window, the resizer (confirmation + progress), Compress Folder (C) and the full-screen duplicates viewer.
-The shortcut and flag tables shown in Settings are in iot_dialogs.py (shared with the Tk version).
+The shortcut, flag and confirmation tables shown in Settings are in iot_dialogs.py.
 """
 import os
 import threading
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QFontMetrics, QGuiApplication
+from datetime import datetime
+
+from PySide6.QtCore import QSize, Qt, QTimer
+from PySide6.QtGui import QFontMetrics, QGuiApplication, QIcon, QPixmap
 from PySide6.QtWidgets import (QCheckBox, QDialog, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
-                               QProgressBar, QScrollArea, QSlider, QVBoxLayout, QWidget)
+                               QListWidget, QListWidgetItem, QProgressBar, QScrollArea, QSlider, QVBoxLayout, QWidget)
 
 import iot_history
 import iot_platform
 import iot_tools
 import iot_utils
 from iot_dialogs import CONFIRMATIONS, FLAGS, SHORTCUTS
-from iot_qt import (P, ElidedLabel, GradientDialog, MessageDialog, button, caps, half_tab_pixmap, keycap, label,
-                    paint_gradient, pil_to_pixmap, transparent_box)
+from iot_qt import (P, ElidedLabel, GradientDialog, MessageDialog, button, caps, flag_html, flag_label, half_tab_pixmap,
+                    keycap, label, paint_gradient, pil_to_pixmap, transparent_box)
 
 
 def _buttons_row(*widgets):
@@ -41,7 +43,7 @@ def confirm(parent, title, text, confirm_text, danger=False, rows=()):
     """Themed yes / no. Returns True when confirmed."""
     dialog = MessageDialog(parent, title, text, buttons=(confirm_text, "Cancel"), primary=0,
                            danger=0 if danger else None, kind="warn" if danger else "question", rows=rows)
-    if danger:   # Enter still confirms, as in the Tk version
+    if danger:   # Enter still confirms
         dialog.buttons[0].setDefault(True)
         dialog.buttons[0].setFocus()
     dialog.exec()
@@ -51,8 +53,9 @@ def confirm(parent, title, text, confirm_text, danger=False, rows=()):
 class TextPrompt(GradientDialog):
     """One text field. ask() returns the text, or None if cancelled."""
 
-    def __init__(self, parent, title, subtitle, field_label, value, confirm_text):
+    def __init__(self, parent, title, subtitle, field_label, value, confirm_text, extra_text=None):
         super().__init__(parent, title)
+        self.extra_chosen = False
         outer = QVBoxLayout(self)
         outer.setContentsMargins(28, 18, 28, 22)
         outer.setSpacing(10)
@@ -66,14 +69,94 @@ class TextPrompt(GradientDialog):
         outer.addSpacing(10)
         ok = button(confirm_text, "primary", callback=self.accept)
         ok.setDefault(True)
-        outer.addLayout(_buttons_row(button("Cancel", callback=self.reject), ok))
+        row = _buttons_row(button("Cancel", callback=self.reject), ok)
+        if extra_text:   # e.g. "Existing Folder…": on the left, apart from Cancel / OK
+            extra = button(extra_text, "", "", self._extra)
+            row.insertWidget(0, extra)
+        outer.addLayout(row)
         self.field.selectAll()
         self.field.setFocus()
 
+    def _extra(self):
+        self.extra_chosen = True
+        self.accept()
+
     @classmethod
-    def ask(cls, parent, title, subtitle, field_label, value, confirm_text):
-        dialog = cls(parent, title, subtitle, field_label, value, confirm_text)
-        return dialog.field.text() if dialog.exec() == QDialog.DialogCode.Accepted else None
+    def ask(cls, parent, title, subtitle, field_label, value, confirm_text, extra_text=None):
+        """The text, None if cancelled, or EXTRA when the extra button was pressed."""
+        dialog = cls(parent, title, subtitle, field_label, value, confirm_text, extra_text)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return EXTRA if dialog.extra_chosen else dialog.field.text()
+
+
+EXTRA = object()   # TextPrompt.ask: the extra button was pressed
+
+
+class FolderPickerDialog(GradientDialog):
+    """Pick a folder in the hub (Move to an existing folder). Type to narrow the list; Enter or a double-click picks."""
+
+    def __init__(self, app, title, subtitle, exclude=()):
+        super().__init__(app, title)
+        self.app, self.chosen = app, None
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(28, 14, 28, 22)
+        outer.setSpacing(10)
+        if subtitle:
+            outer.addWidget(label(subtitle, "muted", wrap=True))
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Type to search folders")
+        self.search.setClearButtonEnabled(True)
+        outer.addWidget(self.search)
+        self.list = QListWidget()
+        self.list.setMinimumSize(560, 360)
+        outer.addWidget(self.list, 1)
+        excluded = {app._norm(p) for p in exclude}
+        self.folders = []
+        for info in app.folder_info_list:
+            path = info["path"]
+            if app._norm(path) in excluded or app._is_pending_delete(path):
+                continue
+            name = info["name"] if info["depth"] else f"{info['name']}  (hub)"
+            self.folders.append((path, info["depth"], name))
+        self._fill()
+        self.search.textChanged.connect(lambda _t: self._fill())
+        self.search.returnPressed.connect(self._pick_current)
+        self.list.itemDoubleClicked.connect(lambda item: self._pick(item))
+        ok = button("Move Here", "primary", callback=self._pick_current)
+        ok.setDefault(True)
+        outer.addLayout(_buttons_row(button("Cancel", callback=self.reject), ok))
+        self.search.setFocus()
+
+    def _fill(self):
+        query = self.search.text().strip().lower()
+        self.list.clear()
+        for path, depth, name in self.folders:
+            if query and query not in name.lower():
+                continue
+            item = QListWidgetItem(("      " * depth if not query else "") + name)
+            if query:   # where it is, since the tree's indents are gone
+                item.setToolTip(path)
+                parent = os.path.relpath(os.path.dirname(path), os.path.dirname(self.app.parent_hub.rstrip("\\/")))
+                item.setText(f"{name}      ·  {parent}" if depth else name)
+            item.setData(Qt.ItemDataRole.UserRole, path)
+            self.list.addItem(item)
+        if self.list.count():
+            self.list.setCurrentRow(0)
+
+    def _pick_current(self):
+        item = self.list.currentItem()
+        if item is not None:
+            self._pick(item)
+
+    def _pick(self, item):
+        self.chosen = item.data(Qt.ItemDataRole.UserRole)
+        self.accept()
+
+    @classmethod
+    def ask(cls, app, title, subtitle, exclude=()):
+        dialog = cls(app, title, subtitle, exclude)
+        return dialog.chosen if dialog.exec() == QDialog.DialogCode.Accepted else None
 
 
 class ProgressDialog(GradientDialog):
@@ -120,8 +203,8 @@ class ProgressDialog(GradientDialog):
 # ==================================================================== Settings
 
 class SettingsDialog(GradientDialog):
-    """Shortcuts reference, folder flags, and the processing / display settings (private copies, so Cancel
-    really discards; applied on Save)."""
+    """Shortcuts reference and every setting. Processing, folder flags and confirmations open their own small windows
+    (Choose…). Everything is a private copy until Save, so Cancel really discards."""
 
     def __init__(self, app):
         super().__init__(app, "Settings")
@@ -129,12 +212,21 @@ class SettingsDialog(GradientDialog):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(28, 14, 28, 22)
         outer.setSpacing(12)
-        outer.addWidget(label("Shortcuts, folder flags and processing options. (Hover for Details)", "muted"))
-        columns = QHBoxLayout()
+        outer.addWidget(label("Shortcuts and options. (Hover for Details)", "muted"))
+        # The two columns sit in a scroll area: on a small or highly scaled screen (1080p at 125%, say) the window
+        # would otherwise be taller than the screen and Save would be out of reach. Normally it never scrolls.
+        self.body = QWidget()
+        self.body.setObjectName("transparent")
+        columns = QHBoxLayout(self.body)
+        columns.setContentsMargins(0, 0, 0, 0)
         columns.setSpacing(44)
-        outer.addLayout(columns, 1)
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll.setWidget(self.body)
+        outer.addWidget(self.scroll, 1)
 
-        # --- left: shortcuts and flags
+        # --- left: shortcuts
         left = QVBoxLayout()
         left.setSpacing(8)
         columns.addLayout(left, 1)
@@ -148,70 +240,36 @@ class SettingsDialog(GradientDialog):
             left.addSpacing(8)
             left.addWidget(caps("In the folder list"))
             left.addWidget(self._shortcut_table(in_list, keys_width))
-        left.addSpacing(8)
-        left.addWidget(caps("Folder flags"))
-        self.flag_boxes = {}
-        flags = QGridLayout()
-        flags.setHorizontalSpacing(10)
-        flags.setVerticalSpacing(6)
-        for row, (key, symbol, text) in enumerate(FLAGS):
-            box = QCheckBox()
-            box.setChecked(app.flags_enabled.get(key, True))
-            box.setCursor(Qt.CursorShape.PointingHandCursor)
-            self.flag_boxes[key] = box
-            flags.addWidget(box, row, 0)
-            flags.addWidget(label(symbol), row, 1)
-            flags.addWidget(label(text, "muted"), row, 2)
-        flags.setColumnStretch(2, 1)
-        left.addLayout(flags)
+        left.addSpacing(22)   # the same breathing room as above the title
         left.addStretch(1)
 
-        # --- right: processing and display
+        # --- right: the settings (private copies)
+        try:   # shown as a percentage of the average (130 = 30% above it); stored as the amount above (30)
+            threshold = float(app.anomaly_threshold_var.get()) + 100
+        except ValueError:
+            threshold = 130.0
+        self.processing = {"ignore": app.ignore_files, "threshold": threshold, "down": app.down_target, "up": app.up_target, "quality": app.jpg_quality,
+                           "strip_exif": app.strip_exif}
+        self.flags = dict(app.flags_enabled)
+        self.confirmations = dict(app.confirmations)
         right = QVBoxLayout()
         right.setSpacing(8)
         columns.addLayout(right, 0)
-        right.addWidget(caps("Processing"))
-        fields = QGridLayout()
-        fields.setHorizontalSpacing(12)
-        fields.setVerticalSpacing(8)
-        right.addLayout(fields)
-        try:   # shown as a percentage of the average (130 = 30% above it); stored as the amount above (30)
-            threshold = f"{float(app.anomaly_threshold_var.get()) + 100:g}"
-        except ValueError:
-            threshold = "130"
-        self.edits = {}
-        for row, (key, text, value, suffix, tip) in enumerate((
-                ("base", "Base image", app.base_image, "which file in folder?",
-                 "Intended to ensure calculations aren't based on thumbnails/covers etc"),
-                ("threshold", f"{iot_platform.FLAG_SIZE} Unusual size threshold", threshold, "% of average",
-                 "(Optional) Intended to help auto-detect potential issues"),
-                ("target", f"{iot_platform.FLAG_TARGET} Target resolution", app.target_resolution, "px",
-                 "(Optional) To check if folders match your typical preferred resolution"),
-                ("down", "Downscale short edge to", app.down_target, "px",
-                 "Your preferred resolution when Downscaling (Length or Width must be at least)"),
-                ("up", "Upscale short edge to", app.up_target, "px",
-                 "Your preferred resolution when Upscaling (Length or Width must be at least)"),
-                ("quality", "JPEG quality", app.jpg_quality, "%",
-                 "Significant file size decrease with no noticeable loss of quality"))):
-            name = label(text)
-            name.setToolTip(tip)
-            edit = QLineEdit(str(value))
-            edit.setFixedWidth(84)
-            edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            edit.setToolTip(tip)
-            fields.addWidget(name, row, 0)
-            fields.addWidget(edit, row, 1)
-            fields.addWidget(label(suffix, "muted"), row, 2)
-            self.edits[key] = edit
-        self.exif = QCheckBox("Strip EXIF data from resized images")
-        self.exif.setChecked(app.strip_exif)
-        self.exif.setToolTip("Removes information like Camera model & GPS co-ords, leave unchecked if unsure")
-        right.addWidget(self.exif)
+        self.processing_summary = self._choose_row(right, "Processing", "Ignored files, resize sizes, JPEG quality, EXIF",
+                                                   self._choose_processing)
+        right.addSpacing(6)
+        self.flags_summary = self._choose_row(right, "Folder flags", "Which flags the folder list and folder box show",
+                                              self._choose_flags)
+        right.addSpacing(6)
+        self.confirm_summary = self._choose_row(right, "Confirmations", "Which actions ask \"are you sure?\" first",
+                                                self._choose_confirmations)
+        self._show_summaries()
         right.addSpacing(10)
-        right.addWidget(caps("Compress folder (C)"))
+
+        right.addWidget(caps("Compress (C)"))
         zip_box, zip_row = transparent_box(QHBoxLayout, 8)
-        zip_tip = ("Where the zip made by Compress Folder (C) goes. Leave it empty to put the zip next to the folder "
-                   "(in the folder above it).")
+        zip_tip = ("Where the zips made by Compress (C) go. Leave it empty to put a folder's zip next to the folder, "
+                   "and a selection's zip in the folder it's from.")
         self.zip_dest = QLineEdit(app.zip_destination)
         self.zip_dest.setPlaceholderText("Next to the folder")
         self.zip_dest.setClearButtonEnabled(True)
@@ -221,23 +279,39 @@ class SettingsDialog(GradientDialog):
         zip_label.setToolTip(zip_tip)
         zip_row.addWidget(zip_label)
         zip_row.addWidget(self.zip_dest, 1)
-        zip_row.addWidget(button("Browse…", "small", "Choose the folder for compressed folders", self._browse_zip))
+        zip_row.addWidget(button("Browse…", "small", "Choose the folder for zips", self._browse_zip))
         right.addWidget(zip_box)
         right.addSpacing(10)
-        right.addWidget(caps("Confirmations"))
-        self.confirmations = dict(app.confirmations)   # private copy: applied on Save
-        confirm_box, confirm_row = transparent_box(QHBoxLayout, 10)
-        self.confirm_summary = label("", "muted")
-        confirm_row.addWidget(self.confirm_summary, 1)
-        choose = button("Choose…", "small", "Pick which actions ask \"are you sure?\" first", self._choose_confirmations)
-        confirm_row.addWidget(choose)
-        right.addWidget(confirm_box)
-        self._show_confirm_summary()
+
+        right.addWidget(caps("Folders"))
+        self.empty_offer = QCheckBox("Offer to delete a folder you've emptied")
+        self.empty_offer.setChecked(app.offer_empty_delete)
+        self.empty_offer.setToolTip("After you move or delete the last picture out of a folder, I.O.T asks whether to "
+                                    "delete the empty folder when it closes (like Q). Only folders left completely empty.")
+        right.addWidget(self.empty_offer)
+        self.existing = QCheckBox("Offer existing folders when moving a range")
+        self.existing.setChecked(app.offer_existing_folders)
+        self.existing.setToolTip("The box that asks for a folder name when you move a range gets an 'Existing "
+                                 "Folder…' button, to move the pictures into a folder that's already in the hub "
+                                 "(names unchanged).")
+        right.addWidget(self.existing)
+        trash = iot_platform.TRASH_NAME
+        self.recycle = QCheckBox(f"Send deleted files to the {trash} when I.O.T closes")
+        self.recycle.setChecked(app.use_recycle_bin and app.trash_available())
+        if app.trash_available():
+            self.recycle.setToolTip(f"Instead of deleting them permanently, pictures you deleted (and the originals of "
+                                    f"resized or rotated ones) and folders marked with Q go to the {trash}, where you "
+                                    f"can still restore them.")
+        else:
+            self.recycle.setEnabled(False)
+            self.recycle.setToolTip("Needs the small send2trash package:  pip install send2trash")
+        right.addWidget(self.recycle)
         right.addSpacing(10)
+
         right.addWidget(caps("Display"))
         self.frost = QCheckBox("Frosted screen behind Zoom preview")
         self.frost.setChecked(app.frost_preview)
-        self.frost.setToolTip("Blurs the rest of the screen while Hover + Hold Z shows an image. "
+        self.frost.setToolTip("Blurs the rest of the screen while Hover + Z shows an image. "
                               "Untick on slower computers if the preview feels sluggish.")
         self.sizes = QCheckBox("Folder sizes in the folder list")
         self.sizes.setChecked(app.tree_show_sizes)
@@ -245,6 +319,20 @@ class SettingsDialog(GradientDialog):
                               "with a Σ total for folders that have sub-folders.")
         right.addWidget(self.frost)
         right.addWidget(self.sizes)
+        tip_box, tip_row = transparent_box(QHBoxLayout, 14)
+        tip_row.addWidget(label("Hover tip shows"))
+        self.hover_boxes = {}
+        for key, text, value, tip in (
+                ("size", "File size", app.hover_size, "The file's size on disk, next to its pixel size"),
+                ("taken", "Date taken", app.hover_taken, "When the photo was taken (from the camera's EXIF data)"),
+                ("camera", "Camera", app.hover_camera, "The camera or phone that took it (from the EXIF data)")):
+            box = QCheckBox(text)
+            box.setChecked(value)
+            box.setToolTip(tip)
+            tip_row.addWidget(box)
+            self.hover_boxes[key] = box
+        tip_row.addStretch(1)
+        right.addWidget(tip_box)
         speed_box, speed_row = transparent_box(QHBoxLayout, 10)
         speed_tip = ("How far the picture grid moves for each notch of the mouse wheel (100% is the normal speed). "
                      "Click the slider, then use the arrow keys to adjust it in 10% steps.")
@@ -280,6 +368,34 @@ class SettingsDialog(GradientDialog):
         save = button("Save", "primary", callback=self.save)
         save.setDefault(True)
         outer.addLayout(_buttons_row(button("Cancel", callback=self.reject), save))
+        self._fit_to_screen()
+
+    def _fit_to_screen(self):
+        """As tall as the settings need, but never taller than the screen: then the settings scroll instead."""
+        self.body.adjustSize()
+        need = self.body.sizeHint()
+        screen = (self.app.screen() or QGuiApplication.primaryScreen()).availableGeometry()
+        self.scroll.setFixedHeight(need.height() + 2)          # first as tall as the settings...
+        self.layout().activate()
+        whole = self.layout().sizeHint().height() + (0 if self._bar_fitted else self.BAR - self.layout().contentsMargins().top())
+        over = whole - (screen.height() - 16)
+        scrolls = over > 0
+        if scrolls:                                            # ...then shorter by what doesn't fit
+            self.scroll.setFixedHeight(max(240, need.height() + 2 - over))
+        bar = self.scroll.verticalScrollBar().sizeHint().width()
+        self.scroll.setMinimumWidth(min(need.width() + (bar + 8 if scrolls else 2), screen.width() - 80))
+
+    @staticmethod
+    def _choose_row(layout, title, tip, callback):
+        """A section heading, a one-line summary and a Choose… button that opens the section's own window."""
+        layout.addWidget(caps(title))
+        box, row = transparent_box(QHBoxLayout, 10)
+        summary = label("", "muted")
+        summary.setToolTip(tip)
+        row.addWidget(summary, 1)
+        row.addWidget(button("Choose…", "small", tip, callback))
+        layout.addWidget(box)
+        return summary
 
     @staticmethod
     def _shortcut_table(rows, keys_width, half_tab=False):
@@ -306,56 +422,181 @@ class SettingsDialog(GradientDialog):
         self.error.setText(text)
         self.error.show()
 
-    def _show_confirm_summary(self):
+    def _show_summaries(self):
+        p = self.processing
+        ignoring = f"Ignore first {p['ignore']}" if p["ignore"] else "Ignore none"
+        self.processing_summary.setText(f"{ignoring}  ·  resize to {p['down']} / {p['up']} px"
+                                        f"  ·  quality {p['quality']}%")
+        shown = [symbol for key, symbol, _ in FLAGS if self.flags.get(key, True)]
+        self.flags_summary.setText(flag_html("Showing  " + "  ".join(shown)) if shown else "All hidden")
         asking = sum(1 for key, *_ in CONFIRMATIONS if self.confirmations.get(key))
         self.confirm_summary.setText(f"{asking} of {len(CONFIRMATIONS)} actions ask first")
+
+    def _choose_processing(self):
+        dialog = ProcessingDialog(self, self.processing)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.processing = dialog.values
+            self._show_summaries()
+
+    def _choose_flags(self):
+        dialog = FlagsDialog(self, self.flags)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.flags = dialog.result_values()
+            self._show_summaries()
 
     def _choose_confirmations(self):
         dialog = ConfirmationsDialog(self, self.confirmations)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.confirmations = dialog.result_values()
-            self._show_confirm_summary()
+            self._show_summaries()
+
+    def _show_confirm_summary(self):   # (older name)
+        self._show_summaries()
 
     def _browse_zip(self):
         start = self.zip_dest.text().strip() or os.path.dirname(self.app.image_folder.rstrip("\\/"))
-        chosen = QFileDialog.getExistingDirectory(self, "Where should compressed folders go?", start)
+        chosen = QFileDialog.getExistingDirectory(self, "Where should zips go?", start)
         if chosen:
             self.zip_dest.setText(os.path.normpath(chosen))
 
     def save(self):
-        app, edits = self.app, self.edits
-        try:
-            anomaly = float(edits["threshold"].text()) - 100     # back to "% above average"
-            down, up = int(edits["down"].text()), int(edits["up"].text())
-            quality = max(1, min(100, int(edits["quality"].text())))
-            resolution, base = int(edits["target"].text()), int(edits["base"].text())
-            if min(down, up, resolution, base) <= 0:
-                raise ValueError
-        except ValueError:
-            self._fail("Every field needs a positive whole number.")
-            return
-        if anomaly < 0:
-            self._fail("Unusual size threshold needs to be 100 or more (100 = the average folder size).")
-            return
+        app, p = self.app, self.processing
         zip_dest = self.zip_dest.text().strip().strip('"')
         if zip_dest and not os.path.isdir(zip_dest):
-            self._fail("The folder for compressed folders doesn't exist. Choose one with Browse, or leave it empty "
-                       "to put zips next to the folder.")
+            self._fail("The folder for zips doesn't exist. Choose one with Browse, or leave it empty to put zips "
+                       "next to the folder.")
             return
         app.zip_destination = os.path.normpath(zip_dest) if zip_dest else ""
         app.confirmations = dict(self.confirmations)
-        app.anomaly_threshold_var.set(f"{anomaly:g}")
-        app.down_target, app.up_target, app.jpg_quality = down, up, quality
-        app.target_resolution, app.base_image = resolution, base
-        for key, box in self.flag_boxes.items():
-            app.flags_enabled[key] = box.isChecked()
+        app.anomaly_threshold_var.set(f"{p['threshold'] - 100:g}")
+        app.down_target, app.up_target, app.jpg_quality = p["down"], p["up"], p["quality"]
+        app.ignore_files, app.strip_exif = p["ignore"], p["strip_exif"]
+        app.flags_enabled.update(self.flags)
         app.frost_preview = self.frost.isChecked()
         app.tree_show_sizes = self.sizes.isChecked()
-        app.strip_exif = self.exif.isChecked()
         app.scroll_speed = self.speed.value() * 10
+        app.hover_size = self.hover_boxes["size"].isChecked()
+        app.hover_taken = self.hover_boxes["taken"].isChecked()
+        app.hover_camera = self.hover_boxes["camera"].isChecked()
+        app.offer_empty_delete = self.empty_offer.isChecked()
+        app.offer_existing_folders = self.existing.isChecked()
+        if self.recycle.isEnabled():
+            app.use_recycle_bin = self.recycle.isChecked()
         app.save_settings()
         self.accept()
         app.handle_anomaly_recalculation_event()
+
+
+class ProcessingDialog(GradientDialog):
+    """Settings > Processing: the base image, the flags' thresholds, the resize sizes, JPEG quality and EXIF."""
+
+    def __init__(self, parent, values):
+        super().__init__(parent, "Processing")
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(28, 14, 28, 22)
+        outer.setSpacing(12)
+        outer.addWidget(label("Hover over a setting for what it does.", "muted"))
+        box = QFrame()
+        box.setObjectName("info")
+        fields = QGridLayout(box)
+        fields.setContentsMargins(18, 14, 18, 14)
+        fields.setHorizontalSpacing(12)
+        fields.setVerticalSpacing(8)
+        self.edits = {}
+        for row, (key, text, suffix, tip) in enumerate((
+                ("ignore", "Ignore files", "at the start of each folder",
+                 "Covers or thumbnails at the start of a folder are skipped by the resolution check, the rename "
+                 "suggestion, the resize estimate and Find Duplicates."),
+                ("threshold", f"{iot_platform.FLAG_SIZE} Unusual size threshold", "% of average",
+                 "(Optional) Intended to help auto-detect potential issues"),
+                ("down", f"{iot_platform.FLAG_DOWN} Downscale short edge to", "px",
+                 "Your preferred resolution when Downscaling. Folders whose first picture (after the ignored ones) "
+                 f"has a longer short edge get {iot_platform.FLAG_DOWN} and only Downscale"),
+                ("up", f"{iot_platform.FLAG_UP} Upscale short edge to", "px",
+                 "Your preferred resolution when Upscaling. Folders whose first picture (after the ignored ones) "
+                 f"has a shorter short edge get {iot_platform.FLAG_UP} and only Upscale"),
+                ("quality", "JPEG quality", "%",
+                 "Significant file size decrease with no noticeable loss of quality"))):
+            name = flag_label(text)
+            name.setToolTip(tip)
+            value = values[key]
+            edit = QLineEdit(f"{value:g}" if isinstance(value, float) else str(value))
+            edit.setFixedWidth(84)
+            edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            edit.setToolTip(tip)
+            fields.addWidget(name, row, 0)
+            fields.addWidget(edit, row, 1)
+            fields.addWidget(label(suffix, "muted"), row, 2)
+            self.edits[key] = edit
+        self.exif = QCheckBox("Strip EXIF data from resized images")
+        self.exif.setChecked(values["strip_exif"])
+        self.exif.setToolTip("Removes information like Camera model & GPS co-ords, leave unchecked if unsure")
+        fields.addWidget(self.exif, len(self.edits), 0, 1, 3)
+        outer.addWidget(box)
+        self.error = label("", wrap=True)
+        self.error.setStyleSheet(f"color: {P['danger']};")
+        self.error.hide()
+        outer.addWidget(self.error)
+        done = button("Done", "primary", callback=self.done_clicked)
+        done.setDefault(True)
+        outer.addLayout(_buttons_row(button("Cancel", callback=self.reject), done))
+        self.values = dict(values)
+
+    def done_clicked(self):
+        edits = self.edits
+        try:
+            threshold = float(edits["threshold"].text())
+            down, up = int(edits["down"].text()), int(edits["up"].text())
+            quality = max(1, min(100, int(edits["quality"].text())))
+            ignore = int(edits["ignore"].text())
+            if min(down, up) <= 0 or ignore < 0:
+                raise ValueError
+        except ValueError:
+            self.error.setText("Every field needs a whole number (Ignore files can be 0; the others more than 0).")
+            self.error.show()
+            return
+        if threshold < 100:
+            self.error.setText("Unusual size threshold needs to be 100 or more (100 = the average folder size).")
+            self.error.show()
+            return
+        self.values = {"ignore": ignore, "threshold": threshold, "down": down, "up": up,
+                       "quality": quality, "strip_exif": self.exif.isChecked()}
+        self.accept()
+
+
+class FlagsDialog(GradientDialog):
+    """Settings > Folder flags: which of the folder list's flags are shown."""
+
+    def __init__(self, parent, values):
+        super().__init__(parent, "Folder flags")
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(28, 14, 28, 22)
+        outer.setSpacing(12)
+        outer.addWidget(label("Flags point out folders that may need attention. Untick the ones you don't want to see.",
+                              "muted", wrap=True))
+        box = QFrame()
+        box.setObjectName("info")
+        grid = QGridLayout(box)
+        grid.setContentsMargins(18, 14, 18, 14)
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(10)
+        self.boxes = {}
+        for row, (key, symbol, text) in enumerate(FLAGS):
+            tick = QCheckBox()
+            tick.setChecked(values.get(key, True))
+            tick.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.boxes[key] = tick
+            grid.addWidget(tick, row, 0)
+            grid.addWidget(flag_label(symbol), row, 1)
+            grid.addWidget(label(text), row, 2)
+        grid.setColumnStretch(2, 1)
+        outer.addWidget(box)
+        done = button("Done", "primary", callback=self.accept)
+        done.setDefault(True)
+        outer.addLayout(_buttons_row(button("Cancel", callback=self.reject), done))
+
+    def result_values(self):
+        return {key: box.isChecked() for key, box in self.boxes.items()}
 
 
 class ConfirmationsDialog(GradientDialog):
@@ -503,13 +744,13 @@ class UndoWindow(GradientDialog):
 # ==================================================================== resizer (D / U)
 
 def run_resizer(app, mode="down", folders=None):
-    """Batch resizer, as the Tk version: confirmation with an estimate, then a progress window while worker
+    """Batch resizer: confirmation with an estimate, then a progress window while worker
     threads resize. folders: every image in these folders (a folder list branch); default: the folder on screen.
     Images are resized in place, keep their names, and the originals go to the session recycle folder."""
     if app.busy:
         return
     if folders is None:
-        jobs = [(app.image_folder, list(app.all_files))]
+        jobs = [(app.image_folder, app.name_ordered_files())]
     else:
         jobs = [(path, iot_utils.list_images(path, app.valid_extensions)) for path in folders]
     jobs = [(path, names) for path, names in jobs if names]
@@ -533,7 +774,10 @@ def run_resizer(app, mode="down", folders=None):
 
     sample_folder, sample_files = jobs[0]
     estimate = iot_tools._estimate_resolution(sample_folder, sample_files, mode, target, app.base_image)
-    sample = f"{iot_utils.ordinal(app.base_image)} image" if len(sample_files) >= app.base_image else "last image"
+    if len(sample_files) < app.base_image:
+        sample = "last picture"
+    else:
+        sample = f"first picture after the {app.ignore_files} ignored" if app.ignore_files else "first picture"
     if len(jobs) > 1:
         sample += f" of '{os.path.basename(sample_folder.rstrip(chr(92) + '/'))}'"
     rows = [("Altered resolution", estimate), ("", f"Estimate from the {sample}")] if estimate else []
@@ -573,7 +817,7 @@ def run_resizer(app, mode="down", folders=None):
         finish()
 
     def finish():
-        tally = {"converted": 0, "skipped": 0, "failed": 0, "cancelled": 0}
+        tally = {"converted": 0, "skipped": 0, "animated": 0, "failed": 0, "cancelled": 0}
         steps, changed, changed_folders = [], [], []
         for (path, name), future in zip(items, futures):
             if future.cancelled():
@@ -607,6 +851,8 @@ def run_resizer(app, mode="down", folders=None):
             message += f", {tally['skipped']} already within bounds"
         if tally["cancelled"]:
             message += f", {tally['cancelled']} cancelled"
+        if tally["animated"]:
+            message += f", {tally['animated']} animated left as they are (resizing keeps only the first frame)"
         if tally["failed"]:
             message += f", {tally['failed']} failed (unreadable or locked)"
         app.log_status(message + ".", "error" if tally["failed"] else "success")
@@ -654,10 +900,10 @@ def _folder_contents(folder):
     return files, folders
 
 
-def _write_zip(temp_path, folder, files, folders, progress, cancel_event):
-    """Worker thread: writes the zip. Paths inside it start with the folder's name, so unzipping gives the folder
-    back. Returns ('done' | 'cancelled' | 'failed', [files that couldn't be read], error text)."""
-    top = os.path.basename(folder.rstrip("\\/")) or "Folder"
+def _write_zip(temp_path, folder, files, folders, progress, cancel_event, top=None):
+    """Worker thread: writes the zip. Paths inside it start with `top` (default: the folder's name), so unzipping gives
+    the folder back. Returns ('done' | 'cancelled' | 'failed', [files that couldn't be read], error text)."""
+    top = top or os.path.basename(folder.rstrip("\\/")) or "Folder"
     skipped = []
 
     def inside(path):
@@ -692,16 +938,24 @@ def _remove_quietly(path):
         pass
 
 
-def run_compress(app):
-    """C / Compress Folder: a zip of the folder on screen (the folder itself, everything in it and its sub-folders),
-    named after the folder, saved where Settings says (or next to the folder). Asks first; Undo deletes the zip."""
+def run_compress(app, names=None, title=None, on_done=None):
+    """C / Compress. Without `names`: a zip of the folder on screen (the folder itself, everything in it and its
+    sub-folders), named after the folder, saved where Settings says (or next to the folder). With `names` (a range or
+    group picks): a zip of just those pictures, inside a folder called `title`, saved where Settings says (or in the
+    folder they're from). Asks first; Undo deletes the zip. on_done() runs once the zip is made."""
     if app.busy:
         return
     folder = app.image_folder
-    top = os.path.basename(folder.rstrip("\\/")) or folder
-    files, folders = _folder_contents(folder)
+    selection = names is not None
+    if selection:
+        top = title
+        files = [os.path.join(folder, name) for name in names]
+        folders = []
+    else:
+        top = os.path.basename(folder.rstrip("\\/")) or folder
+        files, folders = _folder_contents(folder)
     if not files:
-        notice(app, "Compress folder", f"'{top}' has no files to compress.")
+        notice(app, "Compress", f"'{top}' has no files to compress.")
         return
     total_bytes = 0
     for path in files:
@@ -711,7 +965,8 @@ def run_compress(app):
             pass
 
     chosen = app.zip_destination
-    destination = chosen if chosen and os.path.isdir(chosen) else os.path.dirname(folder.rstrip("\\/"))
+    beside = folder if selection else os.path.dirname(folder.rstrip("\\/"))
+    destination = chosen if chosen and os.path.isdir(chosen) else beside
     name = zip_name_for(top, destination)
     final_path = os.path.join(destination, name + ".zip")
     contents = f"{len(files)} file{'s' if len(files) != 1 else ''} ({_size_text(total_bytes)})"
@@ -721,14 +976,21 @@ def run_compress(app):
     if name != top:
         rows.append(("", f"'{top}.zip' is already there, so letters were taken off the end of the name"))
     if chosen and destination != chosen:
-        rows.append(("", f"The folder chosen in Settings isn't available ({chosen}), so the zip goes next to "
-                         "the folder instead"))
+        rows.append(("", f"The folder chosen in Settings isn't available ({chosen}), so the zip goes "
+                         f"{'in the folder they are from' if selection else 'next to the folder'} instead"))
     rows += [("Compression", "Pictures are stored as they are (they're compressed already); other files are "
                              "compressed"),
-             ("Undo", "Deletes the zip. The folder itself isn't changed")]
-    text = (f"Compress '{top}'?\n\nEverything in the folder, including its sub-folders, goes into one zip file, with "
-            "the folder itself inside it.")
-    if app.asks("compress") and not confirm(app, "Compress folder", text, "Compress", rows=rows):
+             ("Undo", "Deletes the zip. The pictures themselves aren't changed" if selection else
+                      "Deletes the zip. The folder itself isn't changed")]
+    if selection:
+        first, last = os.path.basename(files[0]), os.path.basename(files[-1])
+        which = f"{first}  →  {last}" if len(files) > 1 else first
+        text = (f"Compress {len(files)} picture{'s' if len(files) != 1 else ''}?\n\n{which} go into one zip file, "
+                f"inside a folder called '{top}'.")
+    else:
+        text = (f"Compress '{top}'?\n\nEverything in the folder, including its sub-folders, goes into one zip file, "
+                "with the folder itself inside it.")
+    if app.asks("compress") and not confirm(app, "Compress", text, "Compress", rows=rows):
         return
 
     app.busy = True
@@ -745,7 +1007,7 @@ def run_compress(app):
     window.bar.setRange(0, max(1, total_bytes // 1024))   # KB, so very large folders still fit the bar's range
     window.show()
     worker = threading.Thread(target=lambda: result.update(zip(("status", "skipped", "error"), _write_zip(
-        temp_path, folder, files, folders, progress, cancel_event))), daemon=True, name="iot-zip")
+        temp_path, folder, files, folders, progress, cancel_event, top))), daemon=True, name="iot-zip")
     worker.start()
     timer = QTimer(window, interval=100)
 
@@ -790,102 +1052,222 @@ def run_compress(app):
                            f"{skipped[0]}", "warning")
         else:
             app.log_status(f"Compressed '{top}' into {target}  ({undo_keys} deletes the zip)", "success")
+        if on_done:
+            on_done()
 
     timer.timeout.connect(poll)
     timer.start()
 
 
-# ==================================================================== duplicates viewer (F)
+# ==================================================================== duplicates window (F)
 
-class _DupTile(QFrame):
+class _ClickPicture(QLabel):
     def __init__(self, callback):
         super().__init__()
         self.callback = callback
-        self.setObjectName("duptile")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
     def mousePressEvent(self, event):
-        self.callback()
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.callback()
         event.accept()
 
 
-class DuplicatesViewer(QWidget):
-    """Full screen, on the app's gradient: the base image and its matches side by side, each on a panel.
-    Click one to jump to it; Esc, Close or a click on the background closes."""
+class _DupTile(QFrame):
+    """One copy in the Duplicates window: the picture, its details, Keep, Open and Show in Folder."""
 
-    def __init__(self, app, paths):
-        super().__init__(None, Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
+    def __init__(self, window, path, pixmap, details, badges):
+        super().__init__()
+        self.window, self.path = window, path
+        self.setObjectName("duptile")
+        box = QVBoxLayout(self)
+        box.setContentsMargins(16, 14, 16, 14)
+        box.setSpacing(6)
+        picture = _ClickPicture(lambda: window.app.open_path_externally(path))
+        picture.setPixmap(pixmap)
+        picture.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        picture.setToolTip("Open in your default image viewer")
+        box.addWidget(picture, 1)
+        name_row, names = transparent_box(QHBoxLayout, 6)
+        name = ElidedLabel(os.path.basename(path), mode=Qt.TextElideMode.ElideMiddle)
+        name.setStyleSheet("font-weight: 700;")
+        names.addWidget(name, 1)
+        for text in badges:   # "Largest", "Newest": usually what decides which copy to keep
+            badge = label(text.upper(), "fieldlabel")
+            badge.setStyleSheet(f"background: {P['accent_soft']}; color: {P['accent']}; border-radius: 7px; "
+                                "padding: 2px 7px;")
+            names.addWidget(badge)
+        box.addWidget(name_row)
+        box.addWidget(label(details, "muted"))
+        actions, row = transparent_box(QHBoxLayout, 8)
+        self.keep = QCheckBox("Keep")
+        self.keep.setChecked(True)
+        self.keep.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.keep.toggled.connect(lambda _on: window.update_buttons())
+        row.addWidget(self.keep)
+        row.addStretch(1)
+        row.addWidget(button("Open", "small", "Open in your default image viewer",
+                             lambda: window.app.open_path_externally(path)))
+        row.addWidget(button("Show in Folder", "small", "Close this window and scroll to it in the grid",
+                             lambda: window.show_in_folder(path)))
+        box.addWidget(actions)
+
+
+class DuplicatesWindow(GradientDialog):
+    """F: every set of duplicates in the folder. The sets are listed on the left (↑ / ↓); the chosen set is shown on
+    the right, side by side, with each copy's details. Untick the copies you don't want and press Delete Unticked
+    (they go to the recycle folder; Undo brings them back)."""
+
+    def __init__(self, app, sets):
+        super().__init__(app, "Duplicates")
         self.app = app
-        self.setWindowTitle("Duplicates")
-        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        screen = app.screen() or QGuiApplication.primaryScreen()
-        area = screen.geometry()
-        ratio = screen.devicePixelRatio()
-        self.setGeometry(area)
+        self.sets = [list(s) for s in sets]
+        self.tiles = []
+        self.keep_state = {}   # path -> ticked, so re-laying out (a resize) keeps your choices
+        self._relayout = QTimer(self, singleShot=True, interval=120)
+        self._relayout.timeout.connect(lambda: self.show_set(self.list.currentRow()))
+        screen = (app.screen() or QGuiApplication.primaryScreen()).availableGeometry()
+        self.resize(int(screen.width() * 0.88), int(screen.height() * 0.86))
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(34, 28, 34, 30)
-        outer.setSpacing(22)
+        outer.setContentsMargins(28, 14, 28, 22)
+        outer.setSpacing(12)
+        self.summary = label("", "muted", wrap=True)
+        outer.addWidget(self.summary)
+        body = QHBoxLayout()
+        body.setSpacing(18)
+        outer.addLayout(body, 1)
+        self.list = QListWidget()
+        self.list.setFixedWidth(300)
+        self.list.setIconSize(QSize(72, 54))
+        self.list.currentRowChanged.connect(self.show_set)
+        body.addWidget(self.list)
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        body.addWidget(self.scroll, 1)
+        self.delete_button = button("Delete Unticked", "danger", "Delete the copies you've unticked (Undo brings them "
+                                    "back)", self.delete_unticked)
+        close = button("Close", callback=self.reject)
+        outer.addLayout(_buttons_row(self.delete_button, close))
+        self._fill_list()
+        self.list.setFocus()
 
-        # header: what this is, how to use it, and Close
-        head = QHBoxLayout()
-        head.setSpacing(16)
-        titles = QVBoxLayout()
-        titles.setSpacing(2)
-        titles.addWidget(label("Duplicates", "h2"))
-        titles.addWidget(label(f"{len(paths)} matching images (98%+ match with the base image)  ·  click one to jump "
-                               "to it in the grid  ·  Esc to close", "muted"))
-        head.addLayout(titles, 1)
-        head.addWidget(button("Close", "", "Back to the grid  (Esc)", self.close))
-        outer.addLayout(head)
-
-        row = QHBoxLayout()
-        row.setSpacing(22)
-        outer.addLayout(row, 1)
-        tile_w = (area.width() - 68 - 22 * (len(paths) - 1)) // len(paths) - 36
-        tile_h = area.height() - 300
-        for number, path in enumerate(paths):
+    # --- the list of sets
+    def _fill_list(self, row=0):
+        self.list.blockSignals(True)
+        self.list.clear()
+        for paths in self.sets:
+            item = QListWidgetItem(f"{os.path.basename(paths[0])}\n{len(paths)} copies")
             try:
-                orig_w, orig_h = iot_utils.read_display_size(path)
-                scale = min(tile_w / orig_w, tile_h / orig_h)
-                preview, _ = iot_utils.load_preview_image(path, max(1, int(orig_w * scale * ratio)),
-                                                          max(1, int(orig_h * scale * ratio)))
+                thumb, _ = self.app.disk_cache.load(paths[0], 108)
+                icon = pil_to_pixmap(thumb)
+                item.setIcon(QIcon(icon))
+            except Exception:
+                pass
+            self.list.addItem(item)
+        self.list.blockSignals(False)
+        extra = sum(len(s) - 1 for s in self.sets)
+        self.summary.setText(f"{len(self.sets)} set{'s' if len(self.sets) != 1 else ''} of near-identical pictures "
+                             f"(98%+ alike), {extra} extra cop{'ies' if extra != 1 else 'y'}. Untick the copies you don't "
+                             "want, then Delete Unticked: they go to the recycle folder, and Undo brings them back. "
+                             "↑ / ↓ move through the sets; Esc closes.")
+        if self.sets:
+            self.list.setCurrentRow(min(row, len(self.sets) - 1))
+            self.show_set(self.list.currentRow())
+
+    # --- the chosen set
+    def show_set(self, row):
+        old = self.scroll.takeWidget()
+        if old is not None:
+            old.deleteLater()
+        self.tiles = []
+        if not 0 <= row < len(self.sets):
+            return
+        paths = self.sets[row]
+        holder, line = transparent_box(QHBoxLayout, 18)
+        view = self.scroll.viewport().size()
+        shown = min(len(paths), 4)   # more than four copies: they scroll sideways
+        tile_w = max(260, (view.width() - 18 * (shown - 1)) // shown - 34)
+        tile_h = max(200, view.height() - 170)
+        ratio = self.devicePixelRatioF()
+        infos = []
+        for path in paths:
+            try:
+                stat = os.stat(path)
+                width, height = iot_utils.read_display_size(path)
+            except Exception:
+                stat, width, height = None, 0, 0
+            taken = self.app._photo_info_for(path, stat)[0] if stat else None
+            when = taken or (datetime.fromtimestamp(stat.st_mtime).strftime("%Y:%m:%d %H:%M:%S") if stat else "")
+            infos.append((path, stat, width, height, when, bool(taken)))
+        def only_best(key):   # a label only when one copy really stands out (identical copies get none)
+            values = [key(i) for i in infos]
+            best = max(values)
+            return infos[values.index(best)][0] if values.count(best) == 1 else None
+        largest = only_best(lambda i: (i[2] * i[3], i[1].st_size if i[1] else 0))
+        newest = only_best(lambda i: i[4])
+        for path, stat, width, height, when, from_camera in infos:
+            try:
+                scale = min(tile_w / max(1, width), tile_h / max(1, height))
+                preview, _ = iot_utils.load_preview_image(path, max(1, int(width * scale * ratio)),
+                                                          max(1, int(height * scale * ratio)))
                 pixmap = pil_to_pixmap(preview)
                 pixmap.setDevicePixelRatio(ratio)
             except Exception:
-                continue
-            tile = _DupTile(lambda name=os.path.basename(path): self.jump(name))
-            box = QVBoxLayout(tile)
-            box.setContentsMargins(18, 16, 18, 16)
-            box.setSpacing(6)
-            tag = caps("Base image" if number == 0 else f"Match {number}")
-            tag.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            box.addWidget(tag)
-            picture = QLabel()
-            picture.setPixmap(pixmap)
-            picture.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            box.addWidget(picture, 1)
-            name = label(os.path.basename(path))
-            name.setStyleSheet("font-weight: 700;")
-            name.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            size = label(f"{orig_w} × {orig_h} px", "muted")
-            size.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            box.addWidget(name)
-            box.addWidget(size)
-            row.addWidget(tile, 1)
+                pixmap = QPixmap()
+            size = _size_text(stat.st_size) if stat else "?"
+            date = self.app._readable_date(when) if when else ""
+            details = f"{width} × {height} px  ·  {size}" + (f"\n{'Taken' if from_camera else 'Modified'} {date}" if date else "")
+            badges = [b for b, chosen in (("Largest", largest), ("Newest", newest)) if chosen == path and len(paths) > 1]
+            tile = _DupTile(self, path, pixmap, details, badges)
+            tile.keep.setChecked(self.keep_state.get(path, True))
+            tile.keep.toggled.connect(lambda on, p=path: self.keep_state.__setitem__(p, on))
+            tile.setFixedWidth(tile_w + 34)
+            line.addWidget(tile)
+            self.tiles.append(tile)
+        line.addStretch(1)
+        self.scroll.setWidget(holder)
+        self.update_buttons()
 
-    def paintEvent(self, event):
-        paint_gradient(self)
+    def update_buttons(self):
+        unticked = [t for t in self.tiles if not t.keep.isChecked()]
+        kept = len(self.tiles) - len(unticked)
+        self.delete_button.setEnabled(bool(unticked) and kept > 0)
+        self.delete_button.setText(f"Delete {len(unticked)} Unticked" if unticked else "Delete Unticked")
+        self.delete_button.setToolTip("Keep at least one copy" if unticked and not kept else
+                                      "Delete the copies you've unticked (Undo brings them back)")
 
-    def jump(self, name):
-        self.close()
-        self.app._set_duplicate_highlight(name)
-        self.app.jump_to_specific_image_filename(name)
+    def delete_unticked(self):
+        row = self.list.currentRow()
+        doomed = [t.path for t in self.tiles if not t.keep.isChecked()]
+        if not doomed or len(doomed) == len(self.tiles):
+            return
+        deleted = set(self.app.delete_duplicate_copies(doomed))
+        remaining = [p for p in self.sets[row] if p not in deleted]
+        if len(remaining) > 1:
+            self.sets[row] = remaining
+        else:
+            del self.sets[row]   # sorted out
+        if not self.sets:
+            self.accept()
+            return
+        self._fill_list(row)
 
-    def mousePressEvent(self, event):   # the background (tiles handle their own clicks)
-        self.close()
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._relayout.start()   # the copies are sized to the window, which only has its real size now
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self.isVisible():
+            self._relayout.start()
+
+    def show_in_folder(self, path):
+        self.accept()
+        self.app.show_picture(os.path.basename(path))
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_Escape:
-            self.close()
+        if event.key() in (Qt.Key.Key_Up, Qt.Key.Key_Down) and not self.list.hasFocus():
+            step = -1 if event.key() == Qt.Key.Key_Up else 1
+            self.list.setCurrentRow(max(0, min(self.list.count() - 1, self.list.currentRow() + step)))
             return
         super().keyPressEvent(event)
