@@ -1902,9 +1902,9 @@ class ImageOrganizationToolkit(QMainWindow):
         for text, value in (("Large (300 px)", 300), ("Medium (180 px)", 180), ("Small (60 px)", 60)):
             command(text, None, lambda v=value: self.size_slider.setValue(v), zoom)
         jump = menu.addMenu("Jump")
-        command("Top", None, lambda: self.grid.scroll_to(0), jump)
-        command("Middle", None, self.handle_jump_to_middle_scroll, jump)
-        command("Bottom", None, lambda: self.grid.scroll_to(self.grid.scrollbar.maximum()), jump)
+        command("Top", "T", self.jump_to_top, jump)
+        command("Middle", "M", self.handle_jump_to_middle_scroll, jump)
+        command("Bottom", "B", self.jump_to_bottom, jump)
         sort = menu.addMenu("Sort by")
         self._sort_actions = {}
         for key, text in SORT_MODES:
@@ -2006,7 +2006,9 @@ class ImageOrganizationToolkit(QMainWindow):
                    K.Key_F: self.trigger_duplicate_hash_scan, K.Key_G: self.toggle_group_mode,
                    K.Key_Return: self.copy_group_selection, K.Key_Enter: self.copy_group_selection,
                    K.Key_Escape: lambda: self.toggle_group_mode() if self.group_mode else None,
-                   K.Key_F5: self.refresh}
+                   K.Key_F5: self.refresh,
+                   K.Key_T: self.jump_to_top, K.Key_M: self.handle_jump_to_middle_scroll,
+                   K.Key_B: self.jump_to_bottom}
         action = actions.get(key)
         if action is None:
             return False
@@ -2164,6 +2166,12 @@ class ImageOrganizationToolkit(QMainWindow):
             self._rebuild_file_index()
         self.refresh_folder_button()
         self.log_status("Refreshed.", "success")
+
+    def jump_to_top(self):
+        self.grid.scroll_to(0)
+
+    def jump_to_bottom(self):
+        self.grid.scroll_to(self.grid.scrollbar.maximum())
 
     def handle_jump_to_middle_scroll(self):
         total, view = self.grid.content_height(), self.grid.height()

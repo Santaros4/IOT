@@ -30,7 +30,7 @@ A fast workflow focused all-in-one desktop tool for sorting photo collections: b
 
 ## Getting started
 
-**Requirements:** Python 3 (developed on 3.13), [PySide6](https://pypi.org/project/PySide6/) (the Qt window toolkit) and [Pillow](https://pypi.org/project/pillow/). Drag and drop works on every platform with nothing extra to install.
+**Requirements:** Python 3 (>=3.13, Install before proceeding below), [PySide6](https://pypi.org/project/PySide6/) (the Qt window toolkit) and [Pillow](https://pypi.org/project/pillow/). Drag and drop works on every platform with nothing extra to install.
 
 ```bash
 pip install PySide6 pillow
@@ -77,7 +77,7 @@ Supported formats: **JPEG, PNG, WebP, BMP, GIF and AVIF**, plus **HEIC / HEIF** 
 - **Undo / Log / Settings**, **Refresh (F5)** and a **light / dark theme** switch. Refresh picks up changes made outside I.O.T (in a file manager, say): it re-reads the folder tree and reloads the current folder without losing your place.
 - **Status bar:** messages, the current range selection, and the folder's image count, size and sort order.
 
-Right-clicking the grid opens a menu with Settings, Undo, the Change Log and Refresh, then four sub-menus (*Grid Zoom* presets, *Jump* to the top, middle or bottom, *Sort by*, and *Tools* with every tool) and the options.
+Right-clicking the grid opens a menu with Settings, Undo, the Change Log and Refresh, then four sub-menus (*Grid Zoom* presets, *Jump* to the top, middle or bottom (also **T**, **M**, **B**), *Sort by*, and *Tools* with every tool) and the options.
 
 ### Sort order
 
@@ -324,6 +324,7 @@ Settings are saved in `iot_settings.json` next to `iot.pyw`. If several I.O.T wi
 | Hover + [ / ]              | Rotate the image left / right (in group mode: every picked image)                                  |
 | Double-click               | Open the image in your default image viewer                                                        |
 | W / S                      | Previous / next folder                                                                             |
+| T / M / B                  | Jump to the top / middle / bottom of the folder                                                    |
 | Q                          | Delete the current folder when I.O.T closes (Q again or Undo keeps it)                             |
 | R                          | Rename the current folder                                                                          |
 | Click, Hold R + Click      | Rename a range in place (in group mode: the picked images and the clicked one)                     |

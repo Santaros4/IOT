@@ -9,6 +9,7 @@ SHORTCUTS = (
     ("Hover + [ / ]", "Rotate the image left / right (in group mode: every picked image)"),
     ("Double-click", "Open the image in your default image viewer"),
     ("W / S", "Previous / Next folder"),
+    ("T / M / B", "Jump to the top / middle / bottom of the folder"),
     ("Q", "Delete current folder when IOT closes (Q again or Undo keeps it)"),
     ("R", "Rename the current folder"),
     ("Click, Hold R + Click", "Rename a range in place (in group mode: the picked images + the clicked one)"),
